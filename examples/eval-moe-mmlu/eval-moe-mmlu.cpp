@@ -578,27 +578,29 @@ int main(int argc, char ** argv) {
         }
         return fallback;
     };
-    // OLMoE uses keys "olmoe.expert_count" / "olmoe.expert_used_count";
-    // other MoE archs use their own arch-prefixed keys. Try a few common ones.
+    // Read the model's architecture from general.architecture and derive the
+    // MoE hparam keys as "<arch>.expert_count" / "<arch>.expert_used_count".
+    // This matches the convention llama.cpp uses internally (see
+    // src/llama-arch.cpp LLM_KV_EXPERT_COUNT / LLM_KV_EXPERT_USED_COUNT).
+    char        arch_buf[64] = { 0 };
+    int32_t     arch_n       = llama_model_meta_val_str(model, "general.architecture", arch_buf, sizeof(arch_buf));
+    std::string arch;
+    if (arch_n > 0 && arch_n < (int32_t) sizeof(arch_buf)) {
+        arch.assign(arch_buf, arch_n);
+    } else {
+        LOG_WRN(
+            "could not read general.architecture (returned %d) - "
+            "falling back to olmoe key naming\n",
+            arch_n);
+        arch = "olmoe";
+    }
+    LOG_INF("model architecture (from GGUF) = %s\n", arch.c_str());
+
     int n_expert_meta   = -1;
     int n_expert_k_meta = -1;
-    {
-        static const std::vector<std::string> prefixes = { "olmoe.",    "mixtral.",   "qwen2moe.",
-                                                           "qwen3moe.", "deepseek2.", "gpt-oss." };
-        for (const auto & p : prefixes) {
-            int n = read_meta_int((p + "expert_count").c_str(), -1);
-            int k = read_meta_int((p + "expert_used_count").c_str(), -1);
-            if (n > 0) {
-                n_expert_meta = n;
-            }
-            if (k > 0) {
-                n_expert_k_meta = k;
-            }
-            if (n_expert_meta > 0 && n_expert_k_meta > 0) {
-                break;
-            }
-        }
-    }
+    n_expert_meta       = read_meta_int((arch + ".expert_count").c_str(), -1);
+    n_expert_k_meta     = read_meta_int((arch + ".expert_used_count").c_str(), -1);
+
     // Sensible fallback for OLMoE (16/64/8) so the tool still works if metadata
     // keys are renamed in the future.
     if (n_expert_meta <= 0) {

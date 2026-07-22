@@ -48,6 +48,9 @@ struct moe_accumulator {
     int n_expert   = 0;  // total experts per MoE layer
     int n_expert_k = 0;  // top-k (experts chosen per token)
 
+    // model architecture name from general.architecture
+    std::string arch;
+
     // current subject under evaluation
     std::string current_subject;
 
@@ -595,6 +598,7 @@ int main(int argc, char ** argv) {
         arch = "olmoe";
     }
     LOG_INF("model architecture (from GGUF) = %s\n", arch.c_str());
+    g_acc.arch = arch;
 
     int n_expert_meta   = -1;
     int n_expert_k_meta = -1;
@@ -783,7 +787,7 @@ int main(int argc, char ** argv) {
     std::fprintf(fout, "{\n");
     std::fprintf(fout, "  \"model\": \"%s\",\n", json_escape(params.model.get_name()).c_str());
     std::fprintf(fout, "  \"model_arch\": {\n");
-    std::fprintf(fout, "    \"name\": \"olmoe\",\n");
+    std::fprintf(fout, "    \"name\": \"%s\",\n", json_escape(g_acc.arch).c_str());
     std::fprintf(fout, "    \"n_layer\": %d,\n", g_acc.n_layer);
     std::fprintf(fout, "    \"n_expert\": %d,\n", g_acc.n_expert);
     std::fprintf(fout, "    \"n_expert_used\": %d\n", g_acc.n_expert_k);

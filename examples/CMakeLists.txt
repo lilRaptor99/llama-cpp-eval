@@ -20,6 +20,7 @@ else()
     add_subdirectory(eval-callback)
     add_subdirectory(eval-moe)
     add_subdirectory(eval-moe-mmlu)
+    add_subdirectory(eval-moe-popqa)
 
     add_subdirectory(gguf-hash)
     add_subdirectory(gguf)

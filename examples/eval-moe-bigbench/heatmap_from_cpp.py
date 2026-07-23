@@ -5,11 +5,12 @@
 JSON.
 
 Reads `expert_counts.json` produced by `llama-eval-moe-bigbench` and writes:
-  - `routing_heatmap.png`                  layer x expert overview
-  - `routing_heatmap_by_task.png`          27 tasks x (L*E) cells (log1p)
-  - `accuracy_by_task.png`                 per-task exact-match accuracy
-  - `counts_total.json`                    aggregated [L, E] matrix (sum across tasks)
-  - `metadata.json`                        pass-through + computed totals
+  - `routing_heatmap.png`                       layer x expert overview
+  - `routing_heatmap_by_task.png`               27 tasks x (L*E) cells (log1p)
+  - `routing_heatmap_by_task_normalized.png`    27 tasks x (L*E) cells (row-normalized)
+  - `accuracy_by_task.png`                      per-task exact-match accuracy
+  - `counts_total.json`                         aggregated [L, E] matrix (sum across tasks)
+  - `metadata.json`                             pass-through + computed totals
 
 Schema of the input JSON (`expert_counts.json`):
   {
@@ -182,6 +183,50 @@ def save_task_heatmap(
     )
 
 
+def save_task_heatmap_normalized(
+    task_counts: dict[str, np.ndarray],
+    tasks: list[str],
+    path: Path,
+    *,
+    colormap: str = "viridis",
+    dpi: int = 120,
+) -> bool:
+    """Row-normalized task heatmap (overall + per-layer-pair breakdown).
+
+    Each task's [L, E] matrix is divided by its row-sum so each row sums to 1
+    -- surfaces the per-task expert-mix shape independent of token volume.
+    """
+    # Stack [tasks, L, E] + drop any tasks with zero counts.
+    rows_3d: list[np.ndarray] = []
+    labels:  list[str]       = []
+    for t in tasks:
+        mat = task_counts.get(t)
+        if mat is None or mat.size == 0 or mat.sum() <= 0:
+            continue
+        rows_3d.append(mat.astype(np.int64, copy=False))
+        labels.append(t)
+    if not rows_3d:
+        return False
+
+    M_3d = np.stack(rows_3d)
+    L, E = M_3d.shape[1:]
+    # Row-normalize across (L, E) per task so each row sums to 1.
+    row_sums = M_3d.sum(axis=(1, 2), keepdims=True)
+    safe = np.where(row_sums == 0, 1, row_sums)
+    M_3d_norm = M_3d.astype(np.float64) / safe
+
+    return _draw_category_heatmap(
+        M_3d_norm, labels, L, E,
+        cbar_label="fraction of task's selections",
+        title_prefix=(
+            f"MoE expert activations by BIG-Bench Hard task  -  "
+            f"{len(labels)} tasks x {L * E} cells (row-normalized; "
+            f"overall + per-layer-pair breakdown)"
+        ),
+        path=path, colormap=colormap, dpi=dpi,
+    )
+
+
 def save_accuracy_chart(
     task_counts: dict[str, np.ndarray],
     tasks_raw: dict,
@@ -344,7 +389,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--heatmap",
-        choices=("overview", "tasks", "accuracy", "all"),
+        choices=("overview", "tasks", "accuracy", "normalized", "all"),
         default="all",
         help="Which plot(s) to produce.",
     )
@@ -396,6 +441,17 @@ def main() -> int:
         )
         if wrote:
             print(f"[save] {p.resolve()} (scale={args.scale})")
+        else:
+            print(f"[skip] no tasks with activations; {p.name} not written")
+
+    if args.heatmap in ("normalized", "all"):
+        p = output_dir / "routing_heatmap_by_task_normalized.png"
+        wrote = save_task_heatmap_normalized(
+            task_counts, tasks, p,
+            colormap=args.colormap, dpi=args.dpi,
+        )
+        if wrote:
+            print(f"[save] {p.resolve()} (row-normalized)")
         else:
             print(f"[skip] no tasks with activations; {p.name} not written")
 

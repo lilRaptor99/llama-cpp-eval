@@ -21,6 +21,7 @@ else()
     add_subdirectory(eval-moe)
     add_subdirectory(eval-moe-bigbench)
     add_subdirectory(eval-moe-coactivation)
+    add_subdirectory(eval-moe-include)
     add_subdirectory(eval-moe-mmlu)
     add_subdirectory(eval-moe-popqa)
 

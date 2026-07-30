@@ -1,14 +1,14 @@
     print_summary
 #!/usr/bin/env bash
 #
-# scripts/run-evaluator.sh - orchestrate the 4 MoE-routing evals across a
+# scripts/run-evaluator.sh - orchestrate the 5 MoE-routing evals across a
 # hardcoded list of HF MoE GGUF repos.
 #
 # Behaviour:
-#  - Downloads each of {MMLU, PopQA, BBH, INCLUDE} ONCE into a shared
+#  - Downloads each of {MMLU, PopQA, BBH, HumanEval, INCLUDE} ONCE into a shared
 #    build/datasets/<name>/ directory (idempotent - skipped if the .jsonl
 #    already exists, or pass --redownload to force a refresh).
-#  - Builds the four llama-eval-moe-* binaries if any are missing
+#  - Builds the five llama-eval-moe-* binaries if any are missing
 #    (or pass --rebuild to force a clean rebuild).
 #  - Loops every (model, dataset) cell, skipping cells whose
 #    expert_counts.json already exists in the results tree.
@@ -42,7 +42,7 @@ BUILD_DIR="${REPO_ROOT}/build"
 DATASETS_DIR=""
 RESULTS_DIR=""
 MODELS=("${DEFAULT_MODELS[@]}")
-DATASETS=(mmlu popqa bigbench include)
+DATASETS=(mmlu popqa bigbench humaneval include)
 REBUILD=0
 REDOWNLOAD=0
 SKIP_PLOTS=0
@@ -66,6 +66,7 @@ binary_for() {
         mmlu)     echo "${BUILD_DIR}/bin/llama-eval-moe-mmlu" ;;
         popqa)    echo "${BUILD_DIR}/bin/llama-eval-moe-popqa" ;;
         bigbench) echo "${BUILD_DIR}/bin/llama-eval-moe-bigbench" ;;
+        humaneval) echo "${BUILD_DIR}/bin/llama-eval-moe-humaneval" ;;
         include)  echo "${BUILD_DIR}/bin/llama-eval-moe-include" ;;
         *) _die "binary_for: unknown dataset '$1'" ;;
     esac
@@ -77,6 +78,7 @@ downloader_for() {
         mmlu)     echo "${REPO_ROOT}/examples/eval-moe-mmlu/download_mmlu.py" ;;
         popqa)    echo "${REPO_ROOT}/examples/eval-moe-popqa/download_popqa.py" ;;
         bigbench) echo "${REPO_ROOT}/examples/eval-moe-bigbench/download_bigbench.py" ;;
+        humaneval) echo "${REPO_ROOT}/examples/eval-moe-humaneval/download_humaneval.py" ;;
         include)  echo "${REPO_ROOT}/examples/eval-moe-include/download_include.py" ;;
         *) _die "downloader_for: unknown dataset '$1'" ;;
     esac
@@ -88,6 +90,7 @@ plotter_for() {
         mmlu)     echo "${REPO_ROOT}/examples/eval-moe-mmlu/heatmap_from_cpp.py" ;;
         popqa)    echo "${REPO_ROOT}/examples/eval-moe-popqa/heatmap_from_cpp.py" ;;
         bigbench) echo "${REPO_ROOT}/examples/eval-moe-bigbench/heatmap_from_cpp.py" ;;
+        humaneval) echo "${REPO_ROOT}/examples/eval-moe-humaneval/heatmap_from_cpp.py" ;;
         include)  echo "${REPO_ROOT}/examples/eval-moe-include/heatmap_from_cpp.py" ;;
         *) _die "plotter_for: unknown dataset '$1'" ;;
     esac
@@ -101,6 +104,7 @@ config_flags_for() {
         mmlu)     printf -- '--questions-per-subject 10 --n-shots 5' ;;
         popqa)    printf -- '--questions-per-prop 10 --gen-tokens 16' ;;
         bigbench) printf -- '--questions-per-task 5 --gen-tokens 128' ;;
+        humaneval) printf -- '--questions-per-task 5 --gen-tokens 128' ;;
         include)  printf -- '--questions-per-langdom 5 --n-shots 5 --gen-tokens 16' ;;
         *) _die "config_flags_for: unknown dataset '$1'" ;;
     esac
@@ -122,6 +126,9 @@ dataset_input_flags_for() {
         bigbench)
             printf -- '--bigbench %s --tasks %s' \
                 "${dir}/bigbench.jsonl" "${dir}/tasks.txt" ;;
+        humaneval)
+            printf -- '--humaneval %s --tasks %s' \
+                "${dir}/humaneval.jsonl" "${dir}/tasks.txt" ;;
         include)
             printf -- '--include %s --langdom-list %s' \
                 "${dir}/include.jsonl" "${dir}/languages_domains.txt" ;;
@@ -136,6 +143,7 @@ dataset_jsonl_for() {
         mmlu)     echo "mmlu.jsonl" ;;
         popqa)    echo "popqa.jsonl" ;;
         bigbench) echo "bigbench.jsonl" ;;
+        humaneval) echo "humaneval.jsonl" ;;
         include)  echo "include.jsonl" ;;
         *) _die "dataset_jsonl_for: unknown dataset '$1'" ;;
     esac
@@ -149,7 +157,7 @@ Usage: bash scripts/run-evaluator.sh [options]
 
 Options:
   --models <id> [<id> ...]      restrict to subset of hardcoded MODELS
-  --datasets <ds> [<ds> ...]    restrict to subset of {mmlu,popqa,bigbench,include}
+    --datasets <ds> [<ds> ...]    restrict to subset of {mmlu,popqa,bigbench,humaneval,include}
   --build-dir <path>            llama.cpp build dir   (default: <repo>/build)
   --datasets-dir <path>         shared dataset cache  (default: <build-dir>/datasets)
   --results-dir <path>          per-model results tree (default: <build-dir>/results)
@@ -194,7 +202,7 @@ parse_args() {
 }
 
 validate_choices() {
-    local -a ALL_DS=(mmlu popqa bigbench include)
+    local -a ALL_DS=(mmlu popqa bigbench humaneval include)
     local ds
     for ds in "${DATASETS[@]}"; do
         local known=0
@@ -224,10 +232,11 @@ ensure_build() {
           cmake -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE=Release && \
           cmake --build "${BUILD_DIR}" \
               --target llama-eval-moe-mmlu llama-eval-moe-popqa \
-                       llama-eval-moe-bigbench llama-eval-moe-include -j
+                       llama-eval-moe-bigbench llama-eval-moe-humaneval \
+                       llama-eval-moe-include -j
         ) || _die "cmake build failed"
     else
-        _log_info "all 4 binaries present in ${BUILD_DIR}/bin, skipping rebuild"
+            _log_info "all 5 binaries present in ${BUILD_DIR}/bin, skipping rebuild"
     fi
 }
 

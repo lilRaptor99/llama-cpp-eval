@@ -101,10 +101,10 @@ plotter_for() {
 # "Quick smoke test" recommendations.
 config_flags_for() {
     case "$1" in
-        mmlu)     printf -- '--questions-per-subject 10 --n-shots 5' ;;
+        mmlu)     printf -- '--questions-per-subject 100 --n-shots 5' ;;
         popqa)    printf -- '--questions-per-prop 10 --gen-tokens 16' ;;
         bigbench) printf -- '--questions-per-task 5 --gen-tokens 128' ;;
-        humaneval) printf -- '--questions-per-task 5 --gen-tokens 128' ;;
+        humaneval) printf -- '--questions-per-task 164 --gen-tokens 256' ;;
         include)  printf -- '--questions-per-langdom 5 --n-shots 5 --gen-tokens 16' ;;
         *) _die "config_flags_for: unknown dataset '$1'" ;;
     esac
@@ -276,6 +276,23 @@ model_safe() {
     printf '%s' "${1//\//--}"
 }
 
+# Returns 0 only if the JSON file exists and Python can parse it.
+json_is_valid() {
+    local path="$1"
+    [[ -f "$path" ]] || return 1
+    python3 - "$path" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        json.load(f)
+except Exception:
+    raise SystemExit(1)
+PY
+}
+
 # ------------------------------------------------------------- run_eval
 
 # Runs one (model, dataset) cell. Sets STATUS[model|ds] to OK / SKIPPED /
@@ -292,10 +309,13 @@ run_eval() {
 
     mkdir -p "$out_dir"
 
-    if [[ -f "$json" && $REDOWNLOAD -eq 0 ]]; then
+    if [[ $REDOWNLOAD -eq 0 && -f "$json" ]]; then
+        if json_is_valid "$json"; then
         _log_info "(model=${model}, ds=${ds}) -> SKIPPED (${json} exists)"
         STATUS["${model}|${ds}"]="SKIPPED"
         return 0
+        fi
+        _log_warn "(model=${model}, ds=${ds}) existing ${json} is invalid; regenerating"
     fi
 
     _log_info "(model=${model}, ds=${ds}) running ${binary##*/} ..."

@@ -102,10 +102,10 @@ plotter_for() {
 config_flags_for() {
     case "$1" in
         mmlu)     printf -- '--questions-per-subject 100 --n-shots 5' ;;
-        popqa)    printf -- '--questions-per-prop 10 --gen-tokens 16' ;;
-        bigbench) printf -- '--questions-per-task 5 --gen-tokens 128' ;;
+        popqa)    printf -- '--questions-per-prop 100 --gen-tokens 16' ;;
+        bigbench) printf -- '--questions-per-task 100 --gen-tokens 128' ;;
         humaneval) printf -- '--questions-per-task 164 --gen-tokens 256' ;;
-        include)  printf -- '--questions-per-langdom 5 --n-shots 5 --gen-tokens 16' ;;
+        include)  printf -- '--questions-per-langdom 50 --n-shots 5 --gen-tokens 16' ;;
         *) _die "config_flags_for: unknown dataset '$1'" ;;
     esac
 }

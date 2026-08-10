@@ -30,10 +30,10 @@ readonly REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # Hardcoded HF MoE GGUF repos. Edit freely; each -hf <id> invocation
 # will download + cache the GGUF on first use.
 readonly DEFAULT_MODELS=(
-    "allenai/OLMoE-1B-7B-0125-Instruct-GGUF"
-    "LiteLLMs/Mixtral-8x22B-Instruct-v0.1-GGUF"
-    "mradermacher/deepseek-moe-16b-chat-i1-GGUF"
-    #"unsloth/gpt-oss-120b-GGUF"
+    # "allenai/OLMoE-1B-7B-0125-Instruct-GGUF"
+    # "LiteLLMs/Mixtral-8x22B-Instruct-v0.1-GGUF"
+    # "mradermacher/deepseek-moe-16b-chat-i1-GGUF"
+    "unsloth/gpt-oss-120b-GGUF"
 )
 
 # --------------------------------------------------------- defaults / state

@@ -161,6 +161,50 @@ Writes:
   `marginal_p`, `intra_conditional_p`, `intra_pmi`, `intra_lift`, and the
   top-K inter-layer PMI / lift pairs
 
+## Expert graph visualization (Python)
+
+Render expert nodes in a fixed grid (x = expert index, y = layer index) and
+draw coactivation edges where line thickness is proportional to pair count.
+Inter-layer edges are only drawn between adjacent layers (L -> L+1).
+
+```sh
+source .venv/bin/activate
+python examples/eval-moe-coactivation/plot_expert_graph.py \
+    -i build/moe-coactivation/coactivation.json \
+    -o build/moe-coactivation/expert_graph.png
+```
+
+Default behavior:
+
+- includes both intra-layer and inter-layer edges
+- uses raw pair count for edge thickness
+- keeps top-20 edges per layer-pair block (`--top-k-per-layer-pair 20`)
+- renders all layers by default (override with `--layer-min` / `--layer-max`)
+
+Useful options:
+
+```sh
+# Layer window and stronger pruning
+python examples/eval-moe-coactivation/plot_expert_graph.py \
+    -i build/moe-coactivation/coactivation.json \
+    --layer-min 8 --layer-max 15 \
+    --top-k-per-layer-pair 12 \
+    -o build/moe-coactivation/expert_graph_L8_L15.png
+
+# Plot a subject (requires --per-subject-inter at data collection time for inter edges)
+python examples/eval-moe-coactivation/plot_expert_graph.py \
+    -i build/moe-coactivation/coactivation.json \
+    --subject abstract_algebra \
+    -o build/moe-coactivation/expert_graph_abstract_algebra.png
+```
+
+The plotter supports all four inter output formats automatically:
+
+- `inter_pair_counts` (dense full)
+- `inter_klag_counts` (dense k-lag)
+- `inter_pair_counts_sparse` (sparse COO full)
+- `inter_klag_counts_sparse` (sparse COO k-lag)
+
 ## Sanity validation
 
 ```sh

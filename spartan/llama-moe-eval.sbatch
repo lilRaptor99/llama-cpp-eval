@@ -37,7 +37,7 @@
 # ------------------------------------------------------------------
 #   REPO_ROOT         path to the cloned repo        (default: $HOME/llama-cpp-eval)
 #   SCRATCH_BASE      root for build/datasets/results/hf_cache
-#                                                  (default: ${SCRATCH:-/scratch/$USER}/llama-cpp-eval)
+#                                                  (default: ${SCRATCH:-/data/scratch/projects/uom00014}/llama-cpp-eval)
 #   CUDA_MODULE       Lmod module name for CUDA     (default: cuda/12.6.0)
 #   PYTHON_MODULE     Lmod module name for Python   (default: python/3.11)
 #   GCC_MODULE        Lmod module name for GCC      (default: gcc/12.2.0)
@@ -73,7 +73,7 @@ PYTHON_MODULE="${PYTHON_MODULE:-python/3.11}"
 GCC_MODULE="${GCC_MODULE:-gcc/12.2.0}"
 CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES:-80}"
 REPO_ROOT="${REPO_ROOT:-$HOME/llama-cpp-eval}"
-SCRATCH_BASE="${SCRATCH_BASE:-${SCRATCH:-/scratch/${USER:-$(id -un)}}/llama-cpp-eval}"
+SCRATCH_BASE="${SCRATCH_BASE:-${SCRATCH:-/data/scratch/projects/uom00014}/llama-cpp-eval}"
 
 BUILD_DIR="${SCRATCH_BASE}/build"
 DATASETS_DIR="${SCRATCH_BASE}/datasets"

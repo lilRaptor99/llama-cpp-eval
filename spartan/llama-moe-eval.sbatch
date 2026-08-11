@@ -79,14 +79,22 @@ mkdir -p "${SLURM_SUBMIT_DIR}/spartan/logs"
 # Default module names are taken from the `module avail` output on the
 # gpu-a100 partition (EasyBuild /apps/easybuild-2022 tree). Override
 # these if your partition shows different versions.
-#   CUDA_MODULE     CUDA/12.8.0          (from Core)
-#   GCC_MODULE      GCC/13.3.0           (from Core)
-#   PYTHON_MODULE   Python/3.11.3        (from Compiler/GCCcore/11.3.0)
-# Load order matters: GCC must come before Python (which depends on it),
-# and CUDA should come last (it pulls in the matching cuDNN/NCCL).
+#   CUDA_MODULE     CUDA/12.8.0        (from Core)
+#   GCC_MODULE      GCCcore/11.3.0     (from Core; older compiler that
+#                                     `Python/3.11.3` and its extension
+#                                     modules are built against)
+#   PYTHON_MODULE   Python/3.11.3      (from Compiler/GCCcore/11.3.0)
+# Load order matters: GCCcore must come before Python (which depends on
+# it), and CUDA should come last (it pulls in matching cuDNN/NCCL).
+#
+# IMPORTANT: GCC_MODULE points at the *GCCcore/11.3.0* compiler family
+# rather than the newer GCC/13.3.0 because the Python/3.11.3 stack on
+# this partition lives under Compiler/GCCcore/11.3.0 and cannot be loaded
+# against GCC/13.3.0. If you build your own Python (or a different
+# partition has a newer Python), bump the defaults accordingly.
 CUDA_MODULE="${CUDA_MODULE:-CUDA/12.8.0}"
 PYTHON_MODULE="${PYTHON_MODULE:-Python/3.11.3}"
-GCC_MODULE="${GCC_MODULE:-GCC/13.3.0}"
+GCC_MODULE="${GCC_MODULE:-GCCcore/11.3.0}"
 CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES:-80}"
 REPO_ROOT="${REPO_ROOT:-$HOME/llama-cpp-eval}"
 SCRATCH_BASE="${SCRATCH_BASE:-${SCRATCH:-/data/gpfs/projects/uom00014}/llama-cpp-eval}"
@@ -144,11 +152,27 @@ fi
 
 # `set -u` would crash on the module command if it isn't installed; we
 # unconditionally `module purge` first so we know exactly what we're getting.
+# `load_module_or_die` wraps `module load` so a dependency failure (e.g. the
+# user's Python build requires a different GCCcore than the one loaded)
+# surfaces as a clear fatal message instead of just Lmod's terse stderr.
 set +u
 module purge
-module load "${GCC_MODULE}"
-module load "${PYTHON_MODULE}"
-module load "${CUDA_MODULE}"
+load_module_or_die() {
+    local name="$1"
+    local stderr_log
+    stderr_log="$(mktemp)"
+    if ! module load "${name}" 2>"${stderr_log}"; then
+        echo "[fatal] module load ${name} failed:" >&2
+        sed 's/^/  /' "${stderr_log}" >&2
+        echo "[fatal] Hint: run 'module spider ${name}' on a gpu-a100 node to see the load chain." >&2
+        rm -f "${stderr_log}"
+        exit 3
+    fi
+    rm -f "${stderr_log}"
+}
+load_module_or_die "${GCC_MODULE}"
+load_module_or_die "${PYTHON_MODULE}"
+load_module_or_die "${CUDA_MODULE}"
 module list
 set -u
 

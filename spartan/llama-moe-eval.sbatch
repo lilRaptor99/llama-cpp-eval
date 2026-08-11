@@ -30,12 +30,14 @@
 #   bash spartan/download-models.sh --quant Q4_K_M Q8_0
 #
 #   # 2. submit the GPU job. The defaults below assume the canonical
-#   #    gpu-a100 modules (CUDA/12.8.0, GCC/13.3.0, Python/3.11.3). If
-#   #    module avail reports different versions on your partition, just
-#   #    override the three *MODULE vars.
+#   #    gpu-a100 modules (CUDA/12.4.1 + NCCL/2.22.3-CUDA-12.4.1 +
+#   #    GCCcore/11.3.0 + Python/3.11.3 + CMake/3.31.3). If module
+#   #    avail reports different versions on your partition, just
+#   #    override the *MODULE vars.
 #   sbatch spartan/llama-moe-eval.sbatch
 #   # or, to override:
-#   CUDA_MODULE=CUDA/12.4.1 GCC_MODULE=GCC/12.3.0 \
+#   CUDA_MODULE=CUDA/12.4.1 NCCL_MODULE=NCCL/2.22.3-CUDA-12.4.1 \
+#       GCC_MODULE=GCCcore/11.3.0 \
 #       sbatch spartan/llama-moe-eval.sbatch
 #
 #   # 3. tail logs
@@ -46,9 +48,10 @@
 #   REPO_ROOT         path to the cloned repo        (default: $HOME/llama-cpp-eval)
 #   SCRATCH_BASE      root for build/datasets/results/hf_cache
 #                                                  (default: /data/gpfs/projects/uom00014/llama-cpp-eval)
-#   CUDA_MODULE       Lmod module name for CUDA     (default: CUDA/12.8.0)
+#   CUDA_MODULE       Lmod module name for CUDA     (default: CUDA/12.4.1)
+#   NCCL_MODULE       Lmod module name for NCCL     (default: NCCL/2.22.3-CUDA-12.4.1)
 #   PYTHON_MODULE     Lmod module name for Python   (default: Python/3.11.3)
-#   GCC_MODULE        Lmod module name for GCC      (default: GCC/13.3.0)
+#   GCC_MODULE        Lmod module name for GCC      (default: GCCcore/11.3.0)
 #   CUDA_ARCHITECTURES  passed to cmake              (default: 80  - A100 = SM_80)
 #   EXTRA_CMAKE_FLAGS   extra args for cmake configure (default: unset)
 #   MODELS_OVERRIDE     subset of hardcoded models   (default: all 4)
@@ -79,7 +82,15 @@ mkdir -p "${SLURM_SUBMIT_DIR}/spartan/logs"
 # Default module names are taken from the `module avail` output on the
 # gpu-a100 partition (EasyBuild /apps/easybuild-2022 tree). Override
 # these if your partition shows different versions.
-#   CUDA_MODULE     CUDA/12.8.0        (from Core)
+#   CUDA_MODULE     CUDA/12.4.1        (from Core)
+#   NCCL_MODULE     NCCL/2.22.3-CUDA-12.4.1
+#                                   (only NCCL available on gpu-a100;
+#                                    built against CUDA 12.4.1, so the
+#                                    CUDA stack must match. Without
+#                                    this, llama.cpp's cmake configure
+#                                    prints "Could NOT find NCCL" and
+#                                    multi-GPU tensor splitting falls
+#                                    back to slower peer-copy.)
 #   GCC_MODULE      GCCcore/11.3.0     (from Core; older compiler that
 #                                     `Python/3.11.3` and its extension
 #                                     modules are built against)
@@ -89,15 +100,17 @@ mkdir -p "${SLURM_SUBMIT_DIR}/spartan/logs"
 #                                     `module purge` strips the base
 #                                     cmake that ships with spartan/rhel9)
 # Load order matters: GCCcore must come before Python and CMake (both
-# depend on it), and CUDA should come last (it pulls in matching
-# cuDNN/NCCL).
+# depend on it), CUDA before NCCL (NCCL is built against a specific
+# CUDA), and the stack should be self-consistent (CUDA 12.4.1 + NCCL
+# built against CUDA 12.4.1).
 #
 # IMPORTANT: GCC_MODULE points at the *GCCcore/11.3.0* compiler family
 # rather than the newer GCC/13.3.0 because the Python/3.11.3 stack on
 # this partition lives under Compiler/GCCcore/11.3.0 and cannot be loaded
 # against GCC/13.3.0. If you build your own Python (or a different
 # partition has a newer Python), bump the defaults accordingly.
-CUDA_MODULE="${CUDA_MODULE:-CUDA/12.8.0}"
+CUDA_MODULE="${CUDA_MODULE:-CUDA/12.4.1}"
+NCCL_MODULE="${NCCL_MODULE:-NCCL/2.22.3-CUDA-12.4.1}"
 PYTHON_MODULE="${PYTHON_MODULE:-Python/3.11.3}"
 GCC_MODULE="${GCC_MODULE:-GCCcore/11.3.0}"
 CMAKE_MODULE="${CMAKE_MODULE:-CMake/3.31.3}"
@@ -132,6 +145,7 @@ echo "[$(date -Iseconds)] MODELS        = ${MODELS_OVERRIDE:-<all defaults>}"
 echo "[$(date -Iseconds)] DATASETS      = ${DATASETS_OVERRIDE:-<all defaults>}"
 echo "[$(date -Iseconds)] QUANTS        = ${QUANTS_OVERRIDE}"
 echo "[$(date -Iseconds)] CUDA_MODULE   = ${CUDA_MODULE}"
+echo "[$(date -Iseconds)] NCCL_MODULE   = ${NCCL_MODULE}"
 echo "[$(date -Iseconds)] PYTHON_MODULE = ${PYTHON_MODULE}"
 echo "[$(date -Iseconds)] GCC_MODULE    = ${GCC_MODULE}"
 echo "[$(date -Iseconds)] CMAKE_MODULE  = ${CMAKE_MODULE}"
@@ -154,6 +168,10 @@ if [[ -z "${PYTHON_MODULE}" ]]; then
 fi
 if [[ -z "${CUDA_MODULE}" ]]; then
     echo "[fatal] CUDA_MODULE is empty. Run 'module avail cuda' on a gpu-a100 node and export CUDA_MODULE=<name> before sbatch." >&2
+    exit 3
+fi
+if [[ -z "${NCCL_MODULE}" ]]; then
+    echo "[fatal] NCCL_MODULE is empty. Run 'module avail nccl' on a gpu-a100 node (after loading CUDA) and export NCCL_MODULE=<name> before sbatch." >&2
     exit 3
 fi
 if [[ -z "${CMAKE_MODULE}" ]]; then
@@ -185,6 +203,7 @@ load_module_or_die "${GCC_MODULE}"
 load_module_or_die "${CMAKE_MODULE}"
 load_module_or_die "${PYTHON_MODULE}"
 load_module_or_die "${CUDA_MODULE}"
+load_module_or_die "${NCCL_MODULE}"
 module list
 set -u
 
@@ -192,6 +211,12 @@ set -u
 # PATH. If they aren't, Lmod succeeded but our defaults were wrong.
 if ! command -v nvcc >/dev/null 2>&1; then
     echo "[fatal] nvcc not on PATH after loading ${CUDA_MODULE}. The module exists but doesn't expose nvcc - pick a different CUDA_MODULE." >&2
+    exit 3
+fi
+# NCCL ships headers + libs but no `nccl` binary, so probe for the
+# header that llama.cpp's cmake `find_package(NCCL)` will look for.
+if ! find "${EBROOTNCCL:-/usr}" -name 'nccl.h' 2>/dev/null | grep -q .; then
+    echo "[fatal] nccl.h not found after loading ${NCCL_MODULE}. The module exists but doesn't expose NCCL headers - pick a different NCCL_MODULE or check \${EBROOTNCCL}." >&2
     exit 3
 fi
 if ! command -v gcc >/dev/null 2>&1; then
@@ -210,12 +235,21 @@ echo "[info] nvcc  : $(nvcc --version | tail -1)"
 echo "[info] gcc   : $(gcc --version | head -1)"
 echo "[info] python: $(python3 --version)"
 echo "[info] cmake : $(cmake --version | head -1)"
+echo "[info] nccl  : EBROOTNCCL=${EBROOTNCCL:-<unset>}  NCCL_HOME=${NCCL_HOME:-<unset>}"
 
 # Make sure C++ sees the loaded GCC and that nvcc is on PATH.
 export CC="${CC:-$(command -v gcc)}"
 export CXX="${CXX:-$(command -v g++)}"
 export PATH="${CUDA_HOME:-$(dirname "$(dirname "$(command -v nvcc)")"):/usr/local/cuda/bin}/bin:${PATH}"
 export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:${CUDA_HOME:-/usr/local/cuda}/lib64"
+
+# Help cmake find NCCL. EasyBuild modules expose the install prefix via
+# ${EBROOTNCCL}; set both NCCL_HOME (which llama.cpp's FindNCCL looks at)
+# and add lib to LD_LIBRARY_PATH so runtime dlopen works too.
+if [[ -n "${EBROOTNCCL:-}" ]]; then
+    export NCCL_HOME="${NCCL_HOME:-${EBROOTNCCL}}"
+    export LD_LIBRARY_PATH="${NCCL_HOME}/lib:${LD_LIBRARY_PATH}"
+fi
 
 # OpenMP: per the Spartan docs, set OMP_NUM_THREADS to match the SLURM
 # requested CPUs so multi-threaded math libraries don't oversubscribe.

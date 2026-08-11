@@ -1,5 +1,4 @@
-    print_summary
-#!/usr/bin/env bash
+    #!/usr/bin/env bash
 #
 # scripts/run-evaluator.sh - orchestrate the 5 MoE-routing evals across a
 # hardcoded list of HF MoE GGUF repos.
@@ -255,7 +254,11 @@ ensure_build() {
         # CMAKE_CUDA_ARCHITECTURES from the env). $EXTRA_CMAKE_FLAGS is
         # an escape hatch for users who want to add more options without
         # touching this script.
-        local -a CMAKE_FLAGS=( -DCMAKE_BUILD_TYPE=Release )
+        # -DGGML_CCACHE=OFF silences the upstream "ccache not found"
+        # warning. ccache is only a build-speed accelerator; the binaries
+        # produced are identical. Disable unconditionally so the warning
+        # never appears regardless of whether ccache happens to be on PATH.
+        local -a CMAKE_FLAGS=( -DCMAKE_BUILD_TYPE=Release -DGGML_CCACHE=OFF )
         if [[ $USE_CUDA -eq 1 ]]; then
             CMAKE_FLAGS+=( -DGGML_CUDA=ON )
             if [[ -n "${CUDA_ARCHITECTURES:-}" ]]; then

@@ -127,19 +127,19 @@ You should see:
 All variables are optional. Set them before `sbatch` (or pass via
 `--export=...`).
 
-| Variable             | Default                                     | Notes                                                                   |
-| -------------------- | ------------------------------------------- | ----------------------------------------------------------------------- |
-| `REPO_ROOT`          | `$HOME/llama-cpp-eval`                      | Where the `eval-moe` branch is cloned                                   |
-| `SCRATCH_BASE`       | `${SCRATCH:-/scratch/$USER}/llama-cpp-eval` | Root for build / datasets / results / hf_cache                          |
-| `CUDA_MODULE`        | `cuda/12.6.0`                               | Lmod module name                                                        |
-| `PYTHON_MODULE`      | `python/3.11`                               | Lmod module name                                                        |
-| `GCC_MODULE`         | `gcc/12.2.0`                                | Lmod module name                                                        |
-| `CUDA_ARCHITECTURES` | `80`                                        | A100 = SM_80 (single arch keeps compile time sane)                      |
-| `EXTRA_CMAKE_FLAGS`  | `<unset>`                                   | Spaces-separated extras forwarded to cmake configure                    |
-| `MODELS_OVERRIDE`    | `<all 4 defaults>`                          | Space-separated list of HF repo ids                                     |
-| `DATASETS_OVERRIDE`  | `<all 5 defaults>`                          | Space-separated subset of `{mmlu, popqa, bigbench, humaneval, include}` |
-| `QUANTS_OVERRIDE`    | `Q4_K_M`                                    | Space-separated list of quant tags                                      |
-| `HF_TOKEN`           | `<unset>`                                   | Optional; for gated repos                                               |
+| Variable             | Default                                                                                             | Notes                                                                   |
+| -------------------- | --------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| `REPO_ROOT`          | `$HOME/llama-cpp-eval`                                                                              | Where the `eval-moe` branch is cloned                                   |
+| `SCRATCH_BASE`       | `/data/gpfs/projects/uom00014/llama-cpp-eval` (or `${SCRATCH}/llama-cpp-eval` if `$SCRATCH` is set) | Root for build / datasets / results / hf_cache                          |
+| `CUDA_MODULE`        | `cuda/12.6.0`                                                                                       | Lmod module name                                                        |
+| `PYTHON_MODULE`      | `python/3.11`                                                                                       | Lmod module name                                                        |
+| `GCC_MODULE`         | `gcc/12.2.0`                                                                                        | Lmod module name                                                        |
+| `CUDA_ARCHITECTURES` | `80`                                                                                                | A100 = SM_80 (single arch keeps compile time sane)                      |
+| `EXTRA_CMAKE_FLAGS`  | `<unset>`                                                                                           | Spaces-separated extras forwarded to cmake configure                    |
+| `MODELS_OVERRIDE`    | `<all 4 defaults>`                                                                                  | Space-separated list of HF repo ids                                     |
+| `DATASETS_OVERRIDE`  | `<all 5 defaults>`                                                                                  | Space-separated subset of `{mmlu, popqa, bigbench, humaneval, include}` |
+| `QUANTS_OVERRIDE`    | `Q4_K_M`                                                                                            | Space-separated list of quant tags                                      |
+| `HF_TOKEN`           | `<unset>`                                                                                           | Optional; for gated repos                                               |
 
 ---
 

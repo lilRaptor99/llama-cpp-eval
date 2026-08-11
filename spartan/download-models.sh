@@ -75,7 +75,7 @@ resolve_scratch_base() {
         printf '%s/llama-cpp-eval' "${SCRATCH%/}"
         return
     fi
-    printf '%s/llama-cpp-eval' "/data/scratch/projects/uom00014"
+    printf '%s/llama-cpp-eval' "/data/gpfs/projects/uom00014"
 }
 
 # ----------------------------------------------------------- file enumeration
@@ -249,7 +249,7 @@ Options:
   --pattern <glob>             override the auto-derived allow_patterns
                                (applied to every (model, quant) cell)
   --scratch-base <path>        override SCRATCH_BASE
-                               (default: ${SCRATCH:-/data/scratch/projects/uom00014}/llama-cpp-eval)
+                               (default: ${SCRATCH:-/data/gpfs/projects/uom00014}/llama-cpp-eval)
   --list-quants <model>        print the available .gguf quant tags for one
                                model and exit (does not download anything)
   --yes                        skip the disk-usage confirmation prompt

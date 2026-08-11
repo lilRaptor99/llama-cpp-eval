@@ -3,11 +3,12 @@
 Three artefacts that wrap the existing 5-MoE-routing eval pipeline so it
 runs end-to-end on the Unimelb Spartan HPC under SLURM:
 
-| File                                             | Where it runs         | Purpose                                                             |
-| ------------------------------------------------ | --------------------- | ------------------------------------------------------------------- |
-| [`download-models.sh`](download-models.sh)       | Login node            | Pre-populate the HF cache with the GGUF files the eval will consume |
-| [`llama-moe-eval.sbatch`](llama-moe-eval.sbatch) | GPU node (`gpu-a100`) | Build (CUDA) + run the 4 × 5 × N eval sweep                         |
-| [`README.md`](README.md)                         | —                     | This file                                                           |
+| File                                             | Where it runs         | Purpose                                                                                      |
+| ------------------------------------------------ | --------------------- | -------------------------------------------------------------------------------------------- |
+| [`download-models.sh`](download-models.sh)       | Login node            | Pre-populate the HF cache with the GGUF files the eval will consume                          |
+| [`download-datasets.sh`](download-datasets.sh)   | Login node            | Pre-populate the dataset cache (mmlu/popqa/bigbench/humaneval/include) the eval will consume |
+| [`llama-moe-eval.sbatch`](llama-moe-eval.sbatch) | GPU node (`gpu-a100`) | Build (CUDA) + run the 4 × 5 × N eval sweep                                                  |
+| [`README.md`](README.md)                         | —                     | This file                                                                                    |
 
 The `scripts/run-evaluator.sh` Bash script is unchanged at its core; the
 canvas extends to `--cuda` and `--quant` flags plus a new results tree
@@ -24,7 +25,7 @@ same.
 | `eval-moe` branch of [`lilRaptor99/llama-cpp-eval`](https://github.com/lilRaptor99/llama-cpp-eval.git)                     | The code under test                 | `git clone` to `$HOME/llama-cpp-eval`                                                                                                                                                                                                                                                                                            |
 | `/data/gpfs/projects/uom00014/llama-cpp-eval` writable                                                                     | Build + cache + results storage     | Project quota path on Spartan                                                                                                                                                                                                                                                                                                    |
 | `CUDA/12.4.1` + `NCCL/2.22.3-CUDA-12.4.1` + `Python/3.11.3` + `GCCcore/11.3.0` + `CMake/3.31.3` Lmod modules               | Compiles + runs the C++ binaries    | Already pre-selected as defaults; override via `*_MODULE` env vars if your partition shows different versions. Note that `GCCcore/11.3.0` (the older compiler family) is required, not the newer `GCC/13.3.0`. NCCL must be built against the same CUDA major.minor (12.4.x) since that's the only NCCL available on `gpu-a100`. |
-| `huggingface_hub` + `datasets` (the heatmap step's `numpy` + `matplotlib` come from `SciPy-bundle` + `matplotlib` modules) | Login-node downloads + heatmap step | `pip install --user huggingface_hub datasets` on the login node (and `pip install --user` on the GPU node if heatmaps render there)                                                                                                                                                                                              |
+| `huggingface_hub` + `datasets` (the heatmap step's `numpy` + `matplotlib` come from `SciPy-bundle` + `matplotlib` modules) | Login-node downloads + heatmap step | `pip install --user huggingface_hub datasets` on the login node. The `datasets` package is only needed on the login node (by `download-datasets.sh`); do NOT install it on the GPU node — GPU nodes are firewalled off from pypi anyway. The heatmap step only needs `huggingface_hub` + `numpy` + `matplotlib`.                 |
 
 The default `DEFAULT_MODELS` list in `download-models.sh` only contains
 public HF repos, so `HF_TOKEN` is not required. If you add a gated repo
@@ -59,6 +60,31 @@ match — both write to
 `${HF_CACHE}/hub/models--<org>--<name>/snapshots/<rev>/...`
 (the standard HF hub layout; see `common/hf-cache.cpp` in the repo).
 
+### 1b. Login node — pre-download the eval datasets
+
+> **This step is required.** The Spartan GPU compute nodes are firewalled
+> off from the public internet AND don't ship the `datasets` Python
+> package. Skipping this step will cause the `prepare_dataset()` phase
+> of the GPU job to fail with `error: the 'datasets' package is required`.
+
+```bash
+# Default: all 5 datasets (mmlu, popqa, bigbench, humaneval, include).
+# Total ~100 MB.
+bash spartan/download-datasets.sh
+
+# Just one (e.g. for a smoke test):
+bash spartan/download-datasets.sh --datasets mmlu
+
+# Show what each dataset is without downloading:
+bash spartan/download-datasets.sh --list
+```
+
+The script will `pip install --user datasets` on the login node if it's
+missing, then write each dataset to
+`${SCRATCH_BASE}/datasets/moe-<ds>/<ds>.jsonl` (plus a sidecar like
+`subjects.txt` / `tasks.txt` / `languages_domains.txt`). It's
+idempotent — re-runs skip anything that's already cached.
+
 ### 2. Submit the GPU job
 
 ```bash
@@ -75,13 +101,17 @@ GCC_MODULE=GCCcore/11.3.0 \
 ```
 
 If the heatmap step fails on the GPU node with `ModuleNotFoundError: No
-module named 'huggingface_hub'` or `'datasets'`, those two packages are
-not in the EasyBuild module tree — install them once per user:
+module named 'huggingface_hub'`, that package is not in the EasyBuild
+module tree — install it once per user:
 
 ```bash
 # On the GPU node (after the job has allocated):
-pip install --user huggingface_hub datasets
+pip install --user huggingface_hub
 ```
+
+(The heatmap step does NOT need `datasets`; that's only consumed by the
+login-node `download-datasets.sh` script. Do NOT install `datasets` on
+the GPU node — it would fail because GPU nodes can't reach pypi.)
 
 The `.sbatch` builds the 5 `llama-eval-moe-*` binaries with
 `DGGML_CUDA=ON` (or reuses them if already present) and then runs the
@@ -231,20 +261,21 @@ rm -rf "${SCRATCH_BASE}/hf_cache"
 
 ## Troubleshooting
 
-| Symptom                                                                                                                           | Likely cause                                                                                                                  | Fix                                                                                                                                                               |
-| --------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `module: command not found`                                                                                                       | Lmod not in `.bashrc` on the GPU node                                                                                         | `source /usr/local/lmod/lmod/init/bash` before `module` calls, or trust the .sbatch's `module purge`                                                              |
-| `Lmod has detected the following error: The following module(s) are unknown: "CUDA/12.X"` (or similar)                            | The hard-coded default module name doesn't exist on `gpu-a100` (versions change over time)                                    | `module avail cuda/python/gcc` on a `gpu-a100` node, then re-submit with the exact name (e.g. `CUDA_MODULE=CUDA/12.4.1 sbatch …`)                                 |
-| `Lmod has detected the following error: These module(s) or extension(s) exist but cannot be loaded as requested: "Python/3.11.3"` | The Python module isn't built against the GCC compiler you have loaded (e.g. you used `GCC/13.3.0` but need `GCCcore/11.3.0`) | `module spider Python/3.11.3` to see the required parent compiler, then re-submit with `GCC_MODULE=<spider-suggested-gcc>` (default is `GCCcore/11.3.0`)          |
-| `[fatal] CUDA_MODULE is empty`                                                                                                    | Forgot to export the module env vars                                                                                          | `module avail cuda/python/gcc` on `gpu-a100`, then re-submit with all three exported                                                                              |
-| `nvcc: command not found`                                                                                                         | Wrong CUDA module                                                                                                             | `module avail cuda` on `gpu-a100` and set `CUDA_MODULE`                                                                                                           |
-| `cmake: command not found` (during the build step)                                                                                | `module purge` stripped the base cmake; the .sbatch needs to load a `CMake/...` module explicitly                             | `module avail cmake` on `gpu-a100`; default is `CMake/3.31.3`                                                                                                     |
-| `Could NOT find NCCL` (during the build step)                                                                                     | NCCL module not loaded (or CUDA version mismatch)                                                                             | `module avail nccl` (after loading CUDA) on `gpu-a100`; the only available one is `NCCL/2.22.3-CUDA-12.4.1`, which is why `CUDA_MODULE` defaults to `CUDA/12.4.1` |
-| `ggml_cuda_init: no CUDA devices found`                                                                                           | `CUDA_VISIBLE_DEVICES` empty or wrong GPU count                                                                               | Check `squeue -j $JOBID -o "% Gres"`; request `--gres=gpu:N` to match                                                                                             |
-| C++ binary picks the wrong GGUF                                                                                                   | Quant tag didn't match anything in the repo                                                                                   | Run `bash spartan/download-models.sh --list-quants <repo>` to see the available tags                                                                              |
-| `mkdir: cannot create directory '...'`                                                                                            | The script is trying to write to a path you don't own                                                                         | Pick a writable `SCRATCH_BASE` (e.g. `/data/gpfs/projects/<your-project>/llama-cpp-eval`) and re-submit                                                           |
-| `dataset/moe-*.jsonl` not found                                                                                                   | Datasets weren't downloaded                                                                                                   | The script auto-downloads on first run; if it fails, set `--datasets-dir` to a writable path and re-run                                                           |
-| OOM / `Killed` in job log                                                                                                         | 120B model + activations exceed `--mem`                                                                                       | Raise `--mem` (A100 node has 495 GB total) or use a smaller quant                                                                                                 |
+| Symptom                                                                                                                           | Likely cause                                                                                                                            | Fix                                                                                                                                                                                               |
+| --------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `module: command not found`                                                                                                       | Lmod not in `.bashrc` on the GPU node                                                                                                   | `source /usr/local/lmod/lmod/init/bash` before `module` calls, or trust the .sbatch's `module purge`                                                                                              |
+| `Lmod has detected the following error: The following module(s) are unknown: "CUDA/12.X"` (or similar)                            | The hard-coded default module name doesn't exist on `gpu-a100` (versions change over time)                                              | `module avail cuda/python/gcc` on a `gpu-a100` node, then re-submit with the exact name (e.g. `CUDA_MODULE=CUDA/12.4.1 sbatch …`)                                                                 |
+| `Lmod has detected the following error: These module(s) or extension(s) exist but cannot be loaded as requested: "Python/3.11.3"` | The Python module isn't built against the GCC compiler you have loaded (e.g. you used `GCC/13.3.0` but need `GCCcore/11.3.0`)           | `module spider Python/3.11.3` to see the required parent compiler, then re-submit with `GCC_MODULE=<spider-suggested-gcc>` (default is `GCCcore/11.3.0`)                                          |
+| `[fatal] CUDA_MODULE is empty`                                                                                                    | Forgot to export the module env vars                                                                                                    | `module avail cuda/python/gcc` on `gpu-a100`, then re-submit with all three exported                                                                                                              |
+| `nvcc: command not found`                                                                                                         | Wrong CUDA module                                                                                                                       | `module avail cuda` on `gpu-a100` and set `CUDA_MODULE`                                                                                                                                           |
+| `cmake: command not found` (during the build step)                                                                                | `module purge` stripped the base cmake; the .sbatch needs to load a `CMake/...` module explicitly                                       | `module avail cmake` on `gpu-a100`; default is `CMake/3.31.3`                                                                                                                                     |
+| `Could NOT find NCCL` (during the build step)                                                                                     | NCCL module not loaded (or CUDA version mismatch)                                                                                       | `module avail nccl` (after loading CUDA) on `gpu-a100`; the only available one is `NCCL/2.22.3-CUDA-12.4.1`, which is why `CUDA_MODULE` defaults to `CUDA/12.4.1`                                 |
+| `ggml_cuda_init: no CUDA devices found`                                                                                           | `CUDA_VISIBLE_DEVICES` empty or wrong GPU count                                                                                         | Check `squeue -j $JOBID -o "% Gres"`; request `--gres=gpu:N` to match                                                                                                                             |
+| C++ binary picks the wrong GGUF                                                                                                   | Quant tag didn't match anything in the repo                                                                                             | Run `bash spartan/download-models.sh --list-quants <repo>` to see the available tags                                                                                                              |
+| `mkdir: cannot create directory '...'`                                                                                            | The script is trying to write to a path you don't own                                                                                   | Pick a writable `SCRATCH_BASE` (e.g. `/data/gpfs/projects/<your-project>/llama-cpp-eval`) and re-submit                                                                                           |
+| `dataset/moe-*.jsonl` not found                                                                                                   | Datasets weren't pre-downloaded; the GPU node is firewalled off from the public internet AND doesn't ship the `datasets` Python package | Run on the login node first: `bash spartan/download-datasets.sh --datasets <names>`. The .sbatch will also print a `[warn] ... not staged on scratch` line at job start listing the missing ones. |
+| `error: the 'datasets' package is required` (in `${DATASETS_DIR}/moe-*.download.log`)                                             | Same as above — the C++ binary subprocess tried to download datasets on the GPU node                                                    | Same fix: pre-stage on the login node                                                                                                                                                             |
+| OOM / `Killed` in job log                                                                                                         | 120B model + activations exceed `--mem`                                                                                                 | Raise `--mem` (A100 node has 495 GB total) or use a smaller quant                                                                                                                                 |
 
 ---
 
@@ -253,7 +284,8 @@ rm -rf "${SCRATCH_BASE}/hf_cache"
 ```
 spartan/
 ├── README.md                 # this file
-├── download-models.sh        # login-node pre-download
+├── download-models.sh        # login-node pre-download (HF GGUFs)
+├── download-datasets.sh      # login-node pre-download (eval datasets)
 └── llama-moe-eval.sbatch     # SLURM job (gpu-a100, 4 GPU, 4 days)
 ```
 

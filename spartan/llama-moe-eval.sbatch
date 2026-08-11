@@ -17,10 +17,18 @@
 #    consume. Run on the login node first:
 #        bash spartan/download-models.sh --quant $QUANTS_OVERRIDE
 #    (or just leave default quant=Q4_K_M).
-# 3. Python deps for the heatmap step are available on the GPU node:
-#        pip install --user huggingface_hub numpy matplotlib datasets
+# 3. The datasets the eval will consume have been pre-populated under
+#    $SCRATCH_BASE/datasets. Run on the login node first:
+#        bash spartan/download-datasets.sh
+#    (or --datasets mmlu for a smoke test). GPU compute nodes on
+#    Spartan are firewalled off from the public internet, so datasets
+#    MUST be staged on the login node.
+# 4. Python deps for the heatmap step are available on the GPU node:
+#        pip install --user huggingface_hub numpy matplotlib
 #    (huggingface_hub is also needed by download-models.sh; the eval
-#    binaries themselves do not need it.)
+#    binaries themselves do not need any of these. The `datasets`
+#    package is *only* needed on the login node by download-datasets.sh
+#    - do NOT install it on the GPU node to save bandwidth/space.)
 #
 # Quick start
 # -----------
@@ -28,6 +36,7 @@
 #   ssh spartan
 #   cd ~/llama-cpp-eval && git pull origin eval-moe
 #   bash spartan/download-models.sh --quant Q4_K_M Q8_0
+#   bash spartan/download-datasets.sh
 #
 #   # 2. submit the GPU job. The defaults below assume the canonical
 #   #    gpu-a100 modules (CUDA/12.4.1 + NCCL/2.22.3-CUDA-12.4.1 +
@@ -305,6 +314,37 @@ if command -v nvidia-smi >/dev/null 2>&1; then
     nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader || true
 else
     echo "[warn] nvidia-smi not found on PATH; CUDA may not be active"
+fi
+
+# 4. Make sure the datasets have been pre-populated. GPU compute nodes
+#    on Spartan are firewalled off from the public internet AND don't
+#    ship the `datasets` python package, so we MUST have staged these
+#    from the login node. If any expected dataset is missing, warn
+#    loudly (don't hard-fail - prepare_dataset() inside run-evaluator.sh
+#    will re-attempt on the GPU node and fail with a clearer error).
+missing_datasets=()
+for ds in mmlu popqa bigbench humaneval include; do
+    # If the user narrowed DATASETS_OVERRIDE, only check those.
+    # The surrounding spaces ensure we match whole tokens, not substrings
+    # (e.g. "mmlu" inside a hypothetical "mmlu_v2").
+    if [[ -n "${DATASETS_OVERRIDE:-}" ]]; then
+        case " ${DATASETS_OVERRIDE} " in
+            *" ${ds} "*) ;;
+            *) continue ;;
+        esac
+    fi
+    jsonl="${DATASETS_DIR}/moe-${ds}/${ds}.jsonl"
+    if [[ ! -s "${jsonl}" ]]; then
+        missing_datasets+=("${ds}")
+    fi
+done
+if [[ ${#missing_datasets[@]} -gt 0 ]]; then
+    echo "[warn] ${#missing_datasets[@]} dataset(s) not staged on scratch: ${missing_datasets[*]}"
+    echo "[warn]   (looked under ${DATASETS_DIR}/moe-<ds>/<ds>.jsonl)"
+    echo "[warn] Run on the login node first:"
+    echo "[warn]   bash spartan/download-datasets.sh --datasets ${missing_datasets[*]}"
+    echo "[warn] The GPU job will continue and let prepare_dataset() try+fail,"
+    echo "[warn] but staging on the login node avoids wasted compute-quota time."
 fi
 
 # ---------------------------------------------------------------- run

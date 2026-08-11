@@ -25,10 +25,18 @@
 # Quick start
 # -----------
 #   # 1. login node: pre-download
+#   ssh spartan
+#   cd ~/llama-cpp-eval && git pull origin eval-moe
 #   bash spartan/download-models.sh --quant Q4_K_M Q8_0
 #
-#   # 2. submit the GPU job
+#   # 2. submit the GPU job. The defaults below assume the canonical
+#   #    gpu-a100 modules (CUDA/12.8.0, GCC/13.3.0, Python/3.11.3). If
+#   #    module avail reports different versions on your partition, just
+#   #    override the three *MODULE vars.
 #   sbatch spartan/llama-moe-eval.sbatch
+#   # or, to override:
+#   CUDA_MODULE=CUDA/12.4.1 GCC_MODULE=GCC/12.3.0 \
+#       sbatch spartan/llama-moe-eval.sbatch
 #
 #   # 3. tail logs
 #   tail -f spartan/logs/llama-moe-eval-<jobid>.out
@@ -38,9 +46,9 @@
 #   REPO_ROOT         path to the cloned repo        (default: $HOME/llama-cpp-eval)
 #   SCRATCH_BASE      root for build/datasets/results/hf_cache
 #                                                  (default: /data/gpfs/projects/uom00014/llama-cpp-eval)
-#   CUDA_MODULE       Lmod module name for CUDA     (default: cuda/12.6.0)
-#   PYTHON_MODULE     Lmod module name for Python   (default: python/3.11)
-#   GCC_MODULE        Lmod module name for GCC      (default: gcc/12.2.0)
+#   CUDA_MODULE       Lmod module name for CUDA     (default: CUDA/12.8.0)
+#   PYTHON_MODULE     Lmod module name for Python   (default: Python/3.11.3)
+#   GCC_MODULE        Lmod module name for GCC      (default: GCC/13.3.0)
 #   CUDA_ARCHITECTURES  passed to cmake              (default: 80  - A100 = SM_80)
 #   EXTRA_CMAKE_FLAGS   extra args for cmake configure (default: unset)
 #   MODELS_OVERRIDE     subset of hardcoded models   (default: all 4)
@@ -67,10 +75,18 @@ set -euo pipefail
 SLURM_SUBMIT_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
 mkdir -p "${SLURM_SUBMIT_DIR}/spartan/logs"
 
-# Default values (overridable via env before sbatch)
-CUDA_MODULE="${CUDA_MODULE:-cuda/12.6.0}"
-PYTHON_MODULE="${PYTHON_MODULE:-python/3.11}"
-GCC_MODULE="${GCC_MODULE:-gcc/12.2.0}"
+# Default values (overridable via env before sbatch).
+# Default module names are taken from the `module avail` output on the
+# gpu-a100 partition (EasyBuild /apps/easybuild-2022 tree). Override
+# these if your partition shows different versions.
+#   CUDA_MODULE     CUDA/12.8.0          (from Core)
+#   GCC_MODULE      GCC/13.3.0           (from Core)
+#   PYTHON_MODULE   Python/3.11.3        (from Compiler/GCCcore/11.3.0)
+# Load order matters: GCC must come before Python (which depends on it),
+# and CUDA should come last (it pulls in the matching cuDNN/NCCL).
+CUDA_MODULE="${CUDA_MODULE:-CUDA/12.8.0}"
+PYTHON_MODULE="${PYTHON_MODULE:-Python/3.11.3}"
+GCC_MODULE="${GCC_MODULE:-GCC/13.3.0}"
 CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES:-80}"
 REPO_ROOT="${REPO_ROOT:-$HOME/llama-cpp-eval}"
 SCRATCH_BASE="${SCRATCH_BASE:-${SCRATCH:-/data/gpfs/projects/uom00014}/llama-cpp-eval}"
@@ -109,6 +125,23 @@ echo "[$(date -Iseconds)] EXTRA_CMAKE_FLAGS = ${EXTRA_CMAKE_FLAGS:-<unset>}"
 echo "============================================================"
 
 # ---------------------------------------------------------------- modules
+# Preflight: error out with a clear message if any *_MODULE variable is
+# empty. Without this, an empty CUDA_MODULE would silently become
+# `module load ""` which Lmod might accept as a no-op - giving the user
+# a confusing later error (no nvcc on PATH) instead of the right one.
+if [[ -z "${GCC_MODULE}" ]]; then
+    echo "[fatal] GCC_MODULE is empty. Run 'module avail gcc' on a gpu-a100 node and export GCC_MODULE=<name> before sbatch." >&2
+    exit 3
+fi
+if [[ -z "${PYTHON_MODULE}" ]]; then
+    echo "[fatal] PYTHON_MODULE is empty. Run 'module avail python' on a gpu-a100 node and export PYTHON_MODULE=<name> before sbatch." >&2
+    exit 3
+fi
+if [[ -z "${CUDA_MODULE}" ]]; then
+    echo "[fatal] CUDA_MODULE is empty. Run 'module avail cuda' on a gpu-a100 node and export CUDA_MODULE=<name> before sbatch." >&2
+    exit 3
+fi
+
 # `set -u` would crash on the module command if it isn't installed; we
 # unconditionally `module purge` first so we know exactly what we're getting.
 set +u
@@ -118,6 +151,24 @@ module load "${PYTHON_MODULE}"
 module load "${CUDA_MODULE}"
 module list
 set -u
+
+# Post-load sanity check: make sure the binaries we expect are actually on
+# PATH. If they aren't, Lmod succeeded but our defaults were wrong.
+if ! command -v nvcc >/dev/null 2>&1; then
+    echo "[fatal] nvcc not on PATH after loading ${CUDA_MODULE}. The module exists but doesn't expose nvcc - pick a different CUDA_MODULE." >&2
+    exit 3
+fi
+if ! command -v gcc >/dev/null 2>&1; then
+    echo "[fatal] gcc not on PATH after loading ${GCC_MODULE}. Pick a different GCC_MODULE." >&2
+    exit 3
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "[fatal] python3 not on PATH after loading ${PYTHON_MODULE}. Pick a different PYTHON_MODULE." >&2
+    exit 3
+fi
+echo "[info] nvcc: $(nvcc --version | tail -1)"
+echo "[info] gcc : $(gcc --version | head -1)"
+echo "[info] python: $(python3 --version)"
 
 # Make sure C++ sees the loaded GCC and that nvcc is on PATH.
 export CC="${CC:-$(command -v gcc)}"

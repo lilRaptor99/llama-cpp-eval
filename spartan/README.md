@@ -18,13 +18,13 @@ same.
 
 ## Prerequisites
 
-| What                                                                                                   | Why                                                 | Where to set it up                    |
-| ------------------------------------------------------------------------------------------------------ | --------------------------------------------------- | ------------------------------------- |
-| Spartan account + `gpu-a100` group membership                                                          | Run on A100 nodes                                   | Spartan onboarding                    |
-| `eval-moe` branch of [`lilRaptor99/llama-cpp-eval`](https://github.com/lilRaptor99/llama-cpp-eval.git) | The code under test                                 | `git clone` to `$HOME/llama-cpp-eval` |
-| `$SCRATCH` set                                                                                         | Per-project Lustre scratch volume for build + cache | Default on Spartan                    |
-| `huggingface_hub` + `numpy` + `matplotlib` + `datasets`                                                | Heatmap step + login-node downloads                 | `pip install --user …` on login node  |
-| CUDA module on the GPU node                                                                            | Compiles the C++ binaries                           | `module avail cuda` on `gpu-a100`     |
+| What                                                                                                   | Why                                 | Where to set it up                                  |
+| ------------------------------------------------------------------------------------------------------ | ----------------------------------- | --------------------------------------------------- |
+| Spartan account + `gpu-a100` group membership                                                          | Run on A100 nodes                   | Spartan onboarding                                  |
+| `eval-moe` branch of [`lilRaptor99/llama-cpp-eval`](https://github.com/lilRaptor99/llama-cpp-eval.git) | The code under test                 | `git clone` to `$HOME/llama-cpp-eval`               |
+| `/data/gpfs/projects/uom00014/llama-cpp-eval` writable                                                 | Build + cache + results storage     | Project quota path on Spartan                       |
+| `CUDA/12.8.0` + `Python/3.11.3` + `GCC/13.3.0` Lmod modules                                            | Compiles + runs the C++ binaries    | Already pre-selected as defaults; override via `*_MODULE` env vars if your partition shows different versions |
+| `huggingface_hub` + `datasets` (the heatmap step's `numpy` + `matplotlib` come from `SciPy-bundle` + `matplotlib` modules) | Login-node downloads + heatmap step | `pip install --user huggingface_hub datasets` on the login node (and `pip install --user` on the GPU node if heatmaps render there) |
 
 The default `DEFAULT_MODELS` list in `download-models.sh` only contains
 public HF repos, so `HF_TOKEN` is not required. If you add a gated repo
@@ -63,7 +63,22 @@ match — both write to
 
 ```bash
 # Default: 4 A100 GPUs, 24 CPUs, 128 GB RAM, 4-day wall clock.
+# Default modules: CUDA/12.8.0, Python/3.11.3, GCC/13.3.0
 sbatch spartan/llama-moe-eval.sbatch
+
+# Override modules if `module avail` shows different versions on your
+# partition:
+CUDA_MODULE=CUDA/12.4.1 GCC_MODULE=GCC/12.3.0 \
+    sbatch spartan/llama-moe-eval.sbatch
+```
+
+If the heatmap step fails on the GPU node with `ModuleNotFoundError: No
+module named 'huggingface_hub'` or `'datasets'`, those two packages are
+not in the EasyBuild module tree — install them once per user:
+
+```bash
+# On the GPU node (after the job has allocated):
+pip install --user huggingface_hub datasets
 ```
 
 The `.sbatch` builds the 5 `llama-eval-moe-*` binaries with
@@ -127,19 +142,19 @@ You should see:
 All variables are optional. Set them before `sbatch` (or pass via
 `--export=...`).
 
-| Variable             | Default                                                                                             | Notes                                                                   |
-| -------------------- | --------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
-| `REPO_ROOT`          | `$HOME/llama-cpp-eval`                                                                              | Where the `eval-moe` branch is cloned                                   |
-| `SCRATCH_BASE`       | `/data/gpfs/projects/uom00014/llama-cpp-eval` (or `${SCRATCH}/llama-cpp-eval` if `$SCRATCH` is set) | Root for build / datasets / results / hf_cache                          |
-| `CUDA_MODULE`        | `cuda/12.6.0`                                                                                       | Lmod module name                                                        |
-| `PYTHON_MODULE`      | `python/3.11`                                                                                       | Lmod module name                                                        |
-| `GCC_MODULE`         | `gcc/12.2.0`                                                                                        | Lmod module name                                                        |
-| `CUDA_ARCHITECTURES` | `80`                                                                                                | A100 = SM_80 (single arch keeps compile time sane)                      |
-| `EXTRA_CMAKE_FLAGS`  | `<unset>`                                                                                           | Spaces-separated extras forwarded to cmake configure                    |
-| `MODELS_OVERRIDE`    | `<all 4 defaults>`                                                                                  | Space-separated list of HF repo ids                                     |
-| `DATASETS_OVERRIDE`  | `<all 5 defaults>`                                                                                  | Space-separated subset of `{mmlu, popqa, bigbench, humaneval, include}` |
-| `QUANTS_OVERRIDE`    | `Q4_K_M`                                                                                            | Space-separated list of quant tags                                      |
-| `HF_TOKEN`           | `<unset>`                                                                                           | Optional; for gated repos                                               |
+| Variable             | Default                                                                                             | Notes                                                                    |
+| -------------------- | --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `REPO_ROOT`          | `$HOME/llama-cpp-eval`                                                                              | Where the `eval-moe` branch is cloned                                    |
+| `SCRATCH_BASE`       | `/data/gpfs/projects/uom00014/llama-cpp-eval` (or `${SCRATCH}/llama-cpp-eval` if `$SCRATCH` is set) | Root for build / datasets / results / hf_cache                           |
+| `CUDA_MODULE`        | `CUDA/12.8.0`                                                                                       | Lmod module name; canonical gpu-a100 default (from Core)               |
+| `PYTHON_MODULE`      | `Python/3.11.3`                                                                                     | Lmod module name; canonical gpu-a100 default (from Compiler/GCCcore/11.3.0) |
+| `GCC_MODULE`         | `GCC/13.3.0`                                                                                        | Lmod module name; canonical gpu-a100 default (from Core)               |
+| `CUDA_ARCHITECTURES` | `80`                                                                                                | A100 = SM_80 (single arch keeps compile time sane)                       |
+| `EXTRA_CMAKE_FLAGS`  | `<unset>`                                                                                           | Spaces-separated extras forwarded to cmake configure                     |
+| `MODELS_OVERRIDE`    | `<all 4 defaults>`                                                                                  | Space-separated list of HF repo ids                                      |
+| `DATASETS_OVERRIDE`  | `<all 5 defaults>`                                                                                  | Space-separated subset of `{mmlu, popqa, bigbench, humaneval, include}`  |
+| `QUANTS_OVERRIDE`    | `Q4_K_M`                                                                                            | Space-separated list of quant tags                                       |
+| `HF_TOKEN`           | `<unset>`                                                                                           | Optional; for gated repos                                                |
 
 ---
 
@@ -212,14 +227,17 @@ rm -rf "${SCRATCH_BASE}/hf_cache"
 
 ## Troubleshooting
 
-| Symptom                                 | Likely cause                                    | Fix                                                                                                     |
-| --------------------------------------- | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| `module: command not found`             | Lmod not in `.bashrc` on the GPU node           | `source /usr/local/lmod/lmod/init/bash` before `module` calls, or trust the .sbatch's `module purge`    |
-| `nvcc: command not found`               | Wrong CUDA module                               | `module avail cuda` on `gpu-a100` and set `CUDA_MODULE`                                                 |
-| `ggml_cuda_init: no CUDA devices found` | `CUDA_VISIBLE_DEVICES` empty or wrong GPU count | Check `squeue -j $JOBID -o "% Gres"`; request `--gres=gpu:N` to match                                   |
-| C++ binary picks the wrong GGUF         | Quant tag didn't match anything in the repo     | Run `bash spartan/download-models.sh --list-quants <repo>` to see the available tags                    |
-| `dataset/moe-*.jsonl` not found         | Datasets weren't downloaded                     | The script auto-downloads on first run; if it fails, set `--datasets-dir` to a writable path and re-run |
-| OOM / `Killed` in job log               | 120B model + activations exceed `--mem`         | Raise `--mem` (A100 node has 495 GB total) or use a smaller quant                                       |
+| Symptom                                                                                                 | Likely cause                                            | Fix                                                                                                                      |
+| ------------------------------------------------------------------------------------------------------- | ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `module: command not found`                                                                             | Lmod not in `.bashrc` on the GPU node                   | `source /usr/local/lmod/lmod/init/bash` before `module` calls, or trust the .sbatch's `module purge`                     |
+| `Lmod has detected the following error: The following module(s) are unknown: "CUDA/12.X"` (or similar) | The hard-coded default module name doesn't exist on `gpu-a100` (versions change over time) | `module avail cuda/python/gcc` on a `gpu-a100` node, then re-submit with the exact name (e.g. `CUDA_MODULE=CUDA/12.4.1 sbatch …`) |
+| `[fatal] CUDA_MODULE is empty`                                                                          | Forgot to export the module env vars                    | `module avail cuda/python/gcc` on `gpu-a100`, then re-submit with all three exported                                     |
+| `nvcc: command not found`                                                                               | Wrong CUDA module                                       | `module avail cuda` on `gpu-a100` and set `CUDA_MODULE`                                                                  |
+| `ggml_cuda_init: no CUDA devices found`                                                                 | `CUDA_VISIBLE_DEVICES` empty or wrong GPU count         | Check `squeue -j $JOBID -o "% Gres"`; request `--gres=gpu:N` to match                                                    |
+| C++ binary picks the wrong GGUF                                                                         | Quant tag didn't match anything in the repo             | Run `bash spartan/download-models.sh --list-quants <repo>` to see the available tags                                     |
+| `mkdir: cannot create directory '...'`                                                                  | The script is trying to write to a path you don't own   | Pick a writable `SCRATCH_BASE` (e.g. `/data/gpfs/projects/<your-project>/llama-cpp-eval`) and re-submit                  |
+| `dataset/moe-*.jsonl` not found                                                                         | Datasets weren't downloaded                             | The script auto-downloads on first run; if it fails, set `--datasets-dir` to a writable path and re-run                  |
+| OOM / `Killed` in job log                                                                               | 120B model + activations exceed `--mem`                 | Raise `--mem` (A100 node has 495 GB total) or use a smaller quant                                                        |
 
 ---
 

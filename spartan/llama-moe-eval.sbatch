@@ -63,10 +63,10 @@
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=24
 #SBATCH --mem=128G
-#SBATCH --time=4-00:00:00
+#SBATCH --time=0-06:00:00
 #SBATCH --output=spartan/logs/llama-moe-eval-%j.out
 #SBATCH --error=spartan/logs/llama-moe-eval-%j.err
-#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-type=ALL
 #SBATCH --mail-user=${USER}@student.unimelb.edu.au
 
 set -euo pipefail

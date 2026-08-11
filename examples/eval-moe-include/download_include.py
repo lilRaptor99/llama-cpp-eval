@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 # type: ignore
+#
+# from __future__ import annotations lets us use PEP 604 unions (`dict | None`)
+# and PEP 585 generics (`list[str]`) on Python 3.7+ without a syntax error.
+# Without it, the script crashes at import time on the Spartan login node's
+# system python (3.9) which doesn't support either feature. See
+# spartan/download-datasets.sh for the matching workflow.
+from __future__ import annotations
 
 """Download the CohereLabs/include-base-44 dataset (per-language) and emit a
 consolidated JSONL plus partition lists, ready to be consumed by

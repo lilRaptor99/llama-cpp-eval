@@ -94,21 +94,51 @@ resolve_scratch_base() {
 
 # ----------------------------------------------------- python env preflight
 
+# Pick the best python3 on PATH. On the Spartan login node, the system
+# python is 3.9 (no PEP 604 `X | Y` support), which breaks
+# download_include.py. We try to load the Python/3.11.3 Lmod module
+# silently so that we use a python that supports the modern syntax.
+# The download_include.py script also has `from __future__ import
+# annotations` so it works on 3.7+, but the other downloaders may not,
+# so loading the Lmod python is the safest path.
+PYTHON_BIN=""
+setup_python_env() {
+    # If the user already forced a python, respect it.
+    if [[ -n "${PYTHON:-}" ]]; then
+        PYTHON_BIN="$PYTHON"
+        _log_info "using PYTHON=$PYTHON_BIN (overridden)"
+        return 0
+    fi
+    # Try Lmod (Spartan) for Python/3.11.3.
+    if command -v module >/dev/null 2>&1; then
+        # `module load` writes to stderr; capture+suppress unless it fails.
+        if module load Python/3.11.3 2>/dev/null; then
+            PYTHON_BIN="python3"
+            _log_info "loaded Python/3.11.3 via Lmod (PYTHON_BIN=$PYTHON_BIN, version: $($PYTHON_BIN --version 2>&1))"
+            return 0
+        fi
+    fi
+    # Fall back to whatever python3 is on PATH.
+    PYTHON_BIN="python3"
+    _log_info "no Lmod/Python/3.11.3 available; falling back to PYTHON_BIN=$PYTHON_BIN (version: $($PYTHON_BIN --version 2>&1))"
+    return 0
+}
+
 # The downloaders all `import datasets` (HF datasets library). On the
 # Spartan login node the system python usually doesn't have it; we tell
 # the user once, install to --user, and proceed.
 ensure_python_deps() {
-    if python3 -c 'import datasets' >/dev/null 2>&1; then
+    if "$PYTHON_BIN" -c 'import datasets' >/dev/null 2>&1; then
         _log_info "datasets package already importable"
         return 0
     fi
     _log_warn "the 'datasets' python package is missing - installing to ~/.local now"
-    if ! python3 -m pip install --user --quiet datasets; then
-        _die "pip install --user datasets failed. Check your network or try \`python3 -m pip install --user --break-system-packages datasets\` if PEP 668 is in play."
+    if ! "$PYTHON_BIN" -m pip install --user --quiet datasets; then
+        _die "pip install --user datasets failed. Check your network or try \`$PYTHON_BIN -m pip install --user --break-system-packages datasets\` if PEP 668 is in play."
     fi
-    # Refresh PATH so subsequent python3 invocations see ~/.local.
+    # Refresh PATH so subsequent $PYTHON_BIN invocations see ~/.local.
     export PATH="${HOME}/.local/bin:${PATH}"
-    if ! python3 -c 'import datasets' >/dev/null 2>&1; then
+    if ! "$PYTHON_BIN" -c 'import datasets' >/dev/null 2>&1; then
         _die "pip install --user datasets succeeded but 'import datasets' still fails. Check PYTHONUSERBASE / ~/.local/lib/python*/site-packages exists."
     fi
     _log_info "datasets package installed"
@@ -122,7 +152,7 @@ ensure_python_deps() {
 dataset_is_cached() {
     local jsonl="$1"
     [[ -s "$jsonl" ]] || return 1
-    python3 - "$jsonl" <<'PY' 2>/dev/null
+    "$PYTHON_BIN" - "$jsonl" <<'PY' 2>/dev/null
 import json
 import sys
 path = sys.argv[1]
@@ -172,7 +202,7 @@ download_one_dataset() {
     fi
 
     _log_info "downloading ${ds} -> ${outdir} ..."
-    if ! python3 "$script" --outdir "$outdir" >"${outdir}.download.log" 2>&1; then
+    if ! "$PYTHON_BIN" "$script" --outdir "$outdir" >"${outdir}.download.log" 2>&1; then
         _log_err "downloader for ${ds} failed; see ${outdir}.download.log"
         return 1
     fi
@@ -289,6 +319,7 @@ main() {
     # already diagnose real connectivity problems and write a
     # .download.log with the exact urllib SSL or DNS error.
 
+    setup_python_env
     ensure_python_deps
 
     mkdir -p "${datasets_dir}"

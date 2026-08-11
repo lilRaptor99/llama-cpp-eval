@@ -67,7 +67,7 @@
 #SBATCH --output=spartan/logs/llama-moe-eval-%j.out
 #SBATCH --error=spartan/logs/llama-moe-eval-%j.err
 #SBATCH --mail-type=ALL
-#SBATCH --mail-user=${USER}@student.unimelb.edu.au
+#SBATCH --mail-user=pratheek.senevirathne@student.unimelb.edu.au
 
 set -euo pipefail
 

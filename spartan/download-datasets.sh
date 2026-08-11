@@ -282,12 +282,12 @@ main() {
         return 0
     fi
 
-    # Smoke test: can we even reach pypi / huggingface from here?
-    if ! python3 -c 'import urllib.request, sys; \
-        urllib.request.urlopen("https://huggingface.co/api/models/cais/mmlu", timeout=10).read()' \
-            >/dev/null 2>&1; then
-        _die "can't reach huggingface.co from this host. Are you on the Spartan login node (not a compute node)?"
-    fi
+    # NB: we deliberately do NOT pre-flight TLS/HTTP connectivity to
+    # huggingface.co here. The HF API at /api/models/<id> returns 401
+    # for any URL that requires a token (and the urllib-based probe
+    # misreads that as a network failure). The per-dataset downloaders
+    # already diagnose real connectivity problems and write a
+    # .download.log with the exact urllib SSL or DNS error.
 
     ensure_python_deps
 

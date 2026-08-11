@@ -84,8 +84,13 @@ mkdir -p "${SLURM_SUBMIT_DIR}/spartan/logs"
 #                                     `Python/3.11.3` and its extension
 #                                     modules are built against)
 #   PYTHON_MODULE   Python/3.11.3      (from Compiler/GCCcore/11.3.0)
-# Load order matters: GCCcore must come before Python (which depends on
-# it), and CUDA should come last (it pulls in matching cuDNN/NCCL).
+#   CMAKE_MODULE    CMake/3.31.3       (from Compiler/GCCcore/11.3.0;
+#                                     required by the build step —
+#                                     `module purge` strips the base
+#                                     cmake that ships with spartan/rhel9)
+# Load order matters: GCCcore must come before Python and CMake (both
+# depend on it), and CUDA should come last (it pulls in matching
+# cuDNN/NCCL).
 #
 # IMPORTANT: GCC_MODULE points at the *GCCcore/11.3.0* compiler family
 # rather than the newer GCC/13.3.0 because the Python/3.11.3 stack on
@@ -95,6 +100,7 @@ mkdir -p "${SLURM_SUBMIT_DIR}/spartan/logs"
 CUDA_MODULE="${CUDA_MODULE:-CUDA/12.8.0}"
 PYTHON_MODULE="${PYTHON_MODULE:-Python/3.11.3}"
 GCC_MODULE="${GCC_MODULE:-GCCcore/11.3.0}"
+CMAKE_MODULE="${CMAKE_MODULE:-CMake/3.31.3}"
 CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES:-80}"
 REPO_ROOT="${REPO_ROOT:-$HOME/llama-cpp-eval}"
 SCRATCH_BASE="${SCRATCH_BASE:-${SCRATCH:-/data/gpfs/projects/uom00014}/llama-cpp-eval}"
@@ -128,6 +134,7 @@ echo "[$(date -Iseconds)] QUANTS        = ${QUANTS_OVERRIDE}"
 echo "[$(date -Iseconds)] CUDA_MODULE   = ${CUDA_MODULE}"
 echo "[$(date -Iseconds)] PYTHON_MODULE = ${PYTHON_MODULE}"
 echo "[$(date -Iseconds)] GCC_MODULE    = ${GCC_MODULE}"
+echo "[$(date -Iseconds)] CMAKE_MODULE  = ${CMAKE_MODULE}"
 echo "[$(date -Iseconds)] CUDA_ARCHS    = ${CUDA_ARCHITECTURES}"
 echo "[$(date -Iseconds)] EXTRA_CMAKE_FLAGS = ${EXTRA_CMAKE_FLAGS:-<unset>}"
 echo "============================================================"
@@ -147,6 +154,10 @@ if [[ -z "${PYTHON_MODULE}" ]]; then
 fi
 if [[ -z "${CUDA_MODULE}" ]]; then
     echo "[fatal] CUDA_MODULE is empty. Run 'module avail cuda' on a gpu-a100 node and export CUDA_MODULE=<name> before sbatch." >&2
+    exit 3
+fi
+if [[ -z "${CMAKE_MODULE}" ]]; then
+    echo "[fatal] CMAKE_MODULE is empty. Run 'module avail cmake' on a gpu-a100 node and export CMAKE_MODULE=<name> before sbatch." >&2
     exit 3
 fi
 
@@ -171,6 +182,7 @@ load_module_or_die() {
     rm -f "${stderr_log}"
 }
 load_module_or_die "${GCC_MODULE}"
+load_module_or_die "${CMAKE_MODULE}"
 load_module_or_die "${PYTHON_MODULE}"
 load_module_or_die "${CUDA_MODULE}"
 module list
@@ -190,9 +202,14 @@ if ! command -v python3 >/dev/null 2>&1; then
     echo "[fatal] python3 not on PATH after loading ${PYTHON_MODULE}. Pick a different PYTHON_MODULE." >&2
     exit 3
 fi
-echo "[info] nvcc: $(nvcc --version | tail -1)"
-echo "[info] gcc : $(gcc --version | head -1)"
+if ! command -v cmake >/dev/null 2>&1; then
+    echo "[fatal] cmake not on PATH after loading ${CMAKE_MODULE}. Pick a different CMAKE_MODULE." >&2
+    exit 3
+fi
+echo "[info] nvcc  : $(nvcc --version | tail -1)"
+echo "[info] gcc   : $(gcc --version | head -1)"
 echo "[info] python: $(python3 --version)"
+echo "[info] cmake : $(cmake --version | head -1)"
 
 # Make sure C++ sees the loaded GCC and that nvcc is on PATH.
 export CC="${CC:-$(command -v gcc)}"

@@ -89,7 +89,7 @@ resolve_scratch_base() {
         printf '%s/llama-cpp-eval' "${SCRATCH%/}"
         return
     fi
-    printf '%s/llama-cpp-eval' "/data/gpfs/projects/uom00014"
+    printf '%s/llama-cpp-eval' "/data/scratch/projects/uom00014"
 }
 
 # ----------------------------------------------------- python env preflight
@@ -227,7 +227,7 @@ a no-op. Run this once (or whenever you add a new dataset).
 Options:
   --datasets <list>   space-separated subset of {mmlu,popqa,bigbench,humaneval,include}
                       (default: all 5)
-  --scratch-base DIR  override SCRATCH_BASE (default: /data/gpfs/projects/uom00014/llama-cpp-eval,
+  --scratch-base DIR  override SCRATCH_BASE (default: /data/scratch/projects/uom00014/llama-cpp-eval,
                       or ${SCRATCH}/llama-cpp-eval if $SCRATCH is set)
   --list              show what each dataset is + skip download
   --yes               assume yes to any confirmation prompts
@@ -241,7 +241,7 @@ Examples:
   bash spartan/download-datasets.sh --datasets mmlu
 
   # Different scratch volume (e.g. a project-specific one).
-  bash spartan/download-datasets.sh --scratch-base /data/gpfs/projects/uom00014/llama-cpp-eval
+  bash spartan/download-datasets.sh --scratch-base /data/scratch/projects/uom00014/llama-cpp-eval
 
 Why this exists:
   The Spartan GPU compute nodes are firewalled off from the public

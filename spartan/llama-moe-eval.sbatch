@@ -12,7 +12,7 @@
 # Prerequisites
 # -------------
 # 1. The `eval-moe` branch of https://github.com/lilRaptor99/llama-cpp-eval
-#    is checked out at $REPO_ROOT (default: $HOME/llama-cpp-eval).
+#    is checked out at $REPO_ROOT (default: /data/gpfs/projects/uom00014/llama-cpp-eval).
 # 2. The HF cache has been pre-populated with the GGUF files the eval will
 #    consume. Run on the login node first:
 #        bash spartan/download-models.sh --quant $QUANTS_OVERRIDE
@@ -54,9 +54,9 @@
 #
 # Env-var overrides (export before sbatch, or pass via --export=...)
 # ------------------------------------------------------------------
-#   REPO_ROOT         path to the cloned repo        (default: $HOME/llama-cpp-eval)
+#   REPO_ROOT         path to the cloned repo        (default: /data/gpfs/projects/uom00014/llama-cpp-eval)
 #   SCRATCH_BASE      root for build/datasets/results/hf_cache
-#                                                  (default: /data/gpfs/projects/uom00014/llama-cpp-eval)
+#                                                  (default: /data/scratch/projects/uom00014/llama-cpp-eval)
 #   CUDA_MODULE       Lmod module name for CUDA     (default: CUDA/12.4.1)
 #   NCCL_MODULE       Lmod module name for NCCL     (default: NCCL/2.22.3-CUDA-12.4.1)
 #   PYTHON_MODULE     Lmod module name for Python   (default: Python/3.11.3)
@@ -124,8 +124,8 @@ PYTHON_MODULE="${PYTHON_MODULE:-Python/3.11.3}"
 GCC_MODULE="${GCC_MODULE:-GCCcore/11.3.0}"
 CMAKE_MODULE="${CMAKE_MODULE:-CMake/3.31.3}"
 CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES:-80}"
-REPO_ROOT="${REPO_ROOT:-$HOME/llama-cpp-eval}"
-SCRATCH_BASE="${SCRATCH_BASE:-${SCRATCH:-/data/gpfs/projects/uom00014}/llama-cpp-eval}"
+REPO_ROOT="${REPO_ROOT:-/data/gpfs/projects/uom00014/llama-cpp-eval}"
+SCRATCH_BASE="${SCRATCH_BASE:-${SCRATCH:-/data/scratch/projects/uom00014}/llama-cpp-eval}"
 
 BUILD_DIR="${SCRATCH_BASE}/build"
 DATASETS_DIR="${SCRATCH_BASE}/datasets"

@@ -1,3 +1,4 @@
+| `ModuleNotFoundError: No module named 'matplotlib'` (in `${RESULTS_DIR}/<model>/<quant>/moe-<ds>/plot.log`)                      | Heatmap step couldn't import matplotlib. The .sbatch's preflight should install it automatically; if this still appears the auto-install failed (e.g. pypi unreachable) | Re-submit the job — the install is idempotent and will retry. If it keeps failing, install manually after the job has allocated: `pip install --user numpy matplotlib` |
 # Spartan HPC wrapper for `scripts/run-evaluator.sh`
 
 Three artefacts that wrap the existing 5-MoE-routing eval pipeline so it
@@ -26,6 +27,7 @@ same.
 | `/data/gpfs/projects/uom00014/llama-cpp-eval` writable                                                                     | Build + cache + results storage     | Project quota path on Spartan                                                                                                                                                                                                                                                                                                    |
 | `CUDA/12.4.1` + `NCCL/2.22.3-CUDA-12.4.1` + `Python/3.11.3` + `GCCcore/11.3.0` + `CMake/3.31.3` Lmod modules               | Compiles + runs the C++ binaries    | Already pre-selected as defaults; override via `*_MODULE` env vars if your partition shows different versions. Note that `GCCcore/11.3.0` (the older compiler family) is required, not the newer `GCC/13.3.0`. NCCL must be built against the same CUDA major.minor (12.4.x) since that's the only NCCL available on `gpu-a100`. |
 | `huggingface_hub` + `datasets` (the heatmap step's `numpy` + `matplotlib` come from `SciPy-bundle` + `matplotlib` modules) | Login-node downloads + heatmap step | `pip install --user huggingface_hub datasets` on the login node. The `datasets` package is only needed on the login node (by `download-datasets.sh`); do NOT install it on the GPU node — GPU nodes are firewalled off from pypi anyway. The heatmap step only needs `huggingface_hub` + `numpy` + `matplotlib`.                 |
+| `huggingface_hub` + `datasets` on the login node; `numpy` + `matplotlib` on the GPU node (auto-installed by the .sbatch) | Pre-downloads + heatmap step | `pip install --user huggingface_hub datasets` on the login node. The `datasets` package is only needed on the login node (by `download-datasets.sh`); the .sbatch installs `numpy` + `matplotlib` to ~/.local automatically before invoking the heatmap step. |
 
 The default `DEFAULT_MODELS` list in `download-models.sh` only contains
 public HF repos, so `HF_TOKEN` is not required. If you add a gated repo
@@ -101,17 +103,12 @@ GCC_MODULE=GCCcore/11.3.0 \
 ```
 
 If the heatmap step fails on the GPU node with `ModuleNotFoundError: No
-module named 'huggingface_hub'`, that package is not in the EasyBuild
-module tree — install it once per user:
-
-```bash
-# On the GPU node (after the job has allocated):
-pip install --user huggingface_hub
-```
-
-(The heatmap step does NOT need `datasets`; that's only consumed by the
-login-node `download-datasets.sh` script. Do NOT install `datasets` on
-the GPU node — it would fail because GPU nodes can't reach pypi.)
+The .sbatch automatically runs `pip install --user numpy matplotlib` at
+job start if either is missing, so the heatmap step should never fail
+with a `ModuleNotFoundError`. The heatmap step does NOT need
+`datasets`; that's only consumed by the login-node `download-datasets.sh`
+script. Do NOT install `datasets` on the GPU node — it would fail
+because GPU nodes can't reach pypi.
 
 The `.sbatch` builds the 5 `llama-eval-moe-*` binaries with
 `DGGML_CUDA=ON` (or reuses them if already present) and then runs the

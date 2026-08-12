@@ -24,11 +24,11 @@
 #    Spartan are firewalled off from the public internet, so datasets
 #    MUST be staged on the login node.
 # 4. Python deps for the heatmap step are available on the GPU node:
-#        pip install --user huggingface_hub numpy matplotlib
-#    (huggingface_hub is also needed by download-models.sh; the eval
-#    binaries themselves do not need any of these. The `datasets`
-#    package is *only* needed on the login node by download-datasets.sh
-#    - do NOT install it on the GPU node to save bandwidth/space.)
+# 4. Python deps for the heatmap step (numpy + matplotlib) are
+#    installed automatically by the .sbatch's preflight via
+#    `pip install --user`. The `datasets` package is *only* needed on
+#    the login node by download-datasets.sh - do NOT install it on the
+#    GPU node (the GPU node can't reach pypi anyway).
 #
 # Quick start
 # -----------
@@ -345,6 +345,44 @@ if [[ ${#missing_datasets[@]} -gt 0 ]]; then
     echo "[warn]   bash spartan/download-datasets.sh --datasets ${missing_datasets[*]}"
     echo "[warn] The GPU job will continue and let prepare_dataset() try+fail,"
     echo "[warn] but staging on the login node avoids wasted compute-quota time."
+fi
+
+# 5. Ensure the heatmap step has the python deps it needs. Each
+#    examples/eval-moe-<ds>/heatmap_from_cpp.py does
+#        import numpy as np
+#        import matplotlib.pyplot as plt
+#    The Python/3.11.3 EasyBuild module on gpu-a100 ships neither, so we
+#    install to ~/.local once per user. This is idempotent and very
+#    fast on a cache hit.
+HEATMAP_DEPS=(numpy matplotlib)
+heat_dep_status=()
+for pkg in "${HEATMAP_DEPS[@]}"; do
+    if python3 -c "import ${pkg}" >/dev/null 2>&1; then
+        heat_dep_status+=("${pkg}=ok")
+    else
+        heat_dep_status+=("${pkg}=MISSING")
+    fi
+done
+echo "[info] heatmap python deps: ${heat_dep_status[*]}"
+if printf '%s\n' "${heat_dep_status[@]}" | grep -q MISSING; then
+    echo "[info] installing missing heatmap deps to ~/.local ..."
+    if ! python3 -m pip install --user --quiet numpy matplotlib 2>/tmp/pip.err; then
+        if grep -q "externally-managed-environment\|break-system-packages" /tmp/pip.err; then
+            echo "[info] PEP 668 in play; retrying with --break-system-packages ..."
+            python3 -m pip install --user --quiet --break-system-packages numpy matplotlib \
+                2>/tmp/pip.err || {
+                    echo "[fatal] pip install numpy matplotlib failed:" >&2
+                    sed 's/^/  /' /tmp/pip.err >&2
+                    exit 4
+                }
+        else
+            echo "[fatal] pip install numpy matplotlib failed:" >&2
+            sed 's/^/  /' /tmp/pip.err >&2
+            exit 4
+        fi
+    fi
+    export PATH="${HOME}/.local/bin:${PATH}"
+    echo "[info] heatmap deps installed"
 fi
 
 # ---------------------------------------------------------------- run

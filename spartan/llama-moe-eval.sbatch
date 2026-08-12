@@ -250,6 +250,13 @@ echo "[info] nccl  : EBROOTNCCL=${EBROOTNCCL:-<unset>}  NCCL_HOME=${NCCL_HOME:-<
 export CC="${CC:-$(command -v gcc)}"
 export CXX="${CXX:-$(command -v g++)}"
 export PATH="${CUDA_HOME:-$(dirname "$(dirname "$(command -v nvcc)")"):/usr/local/cuda/bin}/bin:${PATH}"
+# llama.cpp's cmake defaults to BUILD_SHARED_LIBS=ON on Linux, so the
+# eval binaries in $BUILD_DIR/bin link dynamically to libllama.so,
+# libllama-common.so, libggml.so, etc. Those .so files also live in
+# $BUILD_DIR/bin, so add it to LD_LIBRARY_PATH. (New builds also pass
+# -DBUILD_SHARED_LIBS=OFF to cmake for static binaries, making this
+# belt-and-braces; older shared binaries need it.)
+export LD_LIBRARY_PATH="${BUILD_DIR}/bin:${LD_LIBRARY_PATH:-}"
 export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:${CUDA_HOME:-/usr/local/cuda}/lib64"
 
 # Help cmake find NCCL. EasyBuild modules expose the install prefix via

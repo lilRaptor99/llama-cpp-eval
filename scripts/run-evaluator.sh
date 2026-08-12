@@ -258,7 +258,21 @@ ensure_build() {
         # warning. ccache is only a build-speed accelerator; the binaries
         # produced are identical. Disable unconditionally so the warning
         # never appears regardless of whether ccache happens to be on PATH.
+        # -DBUILD_SHARED_LIBS=OFF statically links the eval binaries so they
+        # don't need libllama-common.so / libggml.so / etc. on PATH at
+        # runtime. Without this, llama.cpp's cmake defaults to
+        # BUILD_SHARED_LIBS=ON on Linux (see top-level CMakeLists.txt:62),
+        # which means the binaries have an RPATH baked in at link time.
+        # If BUILD_DIR is moved/renamed/recreated between the link step and
+        # the run step, the eval fails with:
+        #     error while loading shared libraries: libllama-common.so.0
+        # This bit us when SCRATCH_BASE changed from gpfs to scratch on
+        # Spartan - the build dir moved and the existing dynamic binaries
+        # could no longer find their libs. Static linking adds ~100 MB per
+        # binary (negligible vs the 60-240 GB GGUF) and removes the
+        # dependency on $BUILD_DIR/bin being on LD_LIBRARY_PATH.
         local -a CMAKE_FLAGS=( -DCMAKE_BUILD_TYPE=Release -DGGML_CCACHE=OFF )
+            CMAKE_FLAGS+=( -DBUILD_SHARED_LIBS=OFF )
         if [[ $USE_CUDA -eq 1 ]]; then
             CMAKE_FLAGS+=( -DGGML_CUDA=ON )
             if [[ -n "${CUDA_ARCHITECTURES:-}" ]]; then

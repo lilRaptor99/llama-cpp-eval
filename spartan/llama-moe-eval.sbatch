@@ -135,10 +135,11 @@ HF_CACHE="${SCRATCH_BASE}/hf_cache"
 mkdir -p "${BUILD_DIR}" "${DATASETS_DIR}" "${RESULTS_DIR}" "${HF_CACHE}"
 
 # Defaults from scripts/run-evaluator.sh (kept in sync; see DEFAULTS below)
-: "${MODELS_OVERRIDE:=}"      # empty = run all 4 hardcoded models
-: "${DATASETS_OVERRIDE:=}"    # empty = run all 5 datasets
-: "${QUANTS_OVERRIDE:=Q4_K_M}" # default quant
+: "${MODELS_OVERRIDE:=}"        # empty = run all 4 hardcoded models
+: "${DATASETS_OVERRIDE:=}"      # empty = run all 5 datasets
+: "${QUANTS_OVERRIDE:=Q4_K_M}"  # default quant
 : "${EXTRA_CMAKE_FLAGS:=}"
+: "${ROUTING_GRAPH_LINE_SCALE:=}" # empty = use routing_graph_from_cpp.py default (5e-7)
 
 # ---------------------------------------------------------------- banner
 echo "============================================================"
@@ -354,25 +355,29 @@ if [[ ${#missing_datasets[@]} -gt 0 ]]; then
     echo "[warn] but staging on the login node avoids wasted compute-quota time."
 fi
 
-# 5. Ensure the heatmap step has the python deps it needs. Each
-#    examples/eval-moe-<ds>/heatmap_from_cpp.py does
+# 5. Ensure the heatmap + routing-graph post-processing steps have the
+#    python deps they need. Both
+#        examples/eval-moe-<ds>/heatmap_from_cpp.py
+#        examples/eval-moe-<ds>/routing_graph_from_cpp.py
+#        examples/_shared/moe_routing_graph.py
+#    do
 #        import numpy as np
 #        import matplotlib.pyplot as plt
 #    The Python/3.11.3 EasyBuild module on gpu-a100 ships neither, so we
 #    install to ~/.local once per user. This is idempotent and very
 #    fast on a cache hit.
-HEATMAP_DEPS=(numpy matplotlib)
-heat_dep_status=()
-for pkg in "${HEATMAP_DEPS[@]}"; do
+PLOT_DEPS=(numpy matplotlib)
+plot_dep_status=()
+for pkg in "${PLOT_DEPS[@]}"; do
     if python3 -c "import ${pkg}" >/dev/null 2>&1; then
-        heat_dep_status+=("${pkg}=ok")
+        plot_dep_status+=("${pkg}=ok")
     else
-        heat_dep_status+=("${pkg}=MISSING")
+        plot_dep_status+=("${pkg}=MISSING")
     fi
 done
-echo "[info] heatmap python deps: ${heat_dep_status[*]}"
-if printf '%s\n' "${heat_dep_status[@]}" | grep -q MISSING; then
-    echo "[info] installing missing heatmap deps to ~/.local ..."
+echo "[info] plot python deps: ${plot_dep_status[*]}"
+if printf '%s\n' "${plot_dep_status[@]}" | grep -q MISSING; then
+    echo "[info] installing missing plot deps to ~/.local ..."
     if ! python3 -m pip install --user --quiet numpy matplotlib 2>/tmp/pip.err; then
         if grep -q "externally-managed-environment\|break-system-packages" /tmp/pip.err; then
             echo "[info] PEP 668 in play; retrying with --break-system-packages ..."
@@ -389,7 +394,7 @@ if printf '%s\n' "${heat_dep_status[@]}" | grep -q MISSING; then
         fi
     fi
     export PATH="${HOME}/.local/bin:${PATH}"
-    echo "[info] heatmap deps installed"
+    echo "[info] plot deps installed"
 fi
 
 # ---------------------------------------------------------------- run
@@ -414,6 +419,9 @@ fi
 if [[ -n "${QUANTS_OVERRIDE}" ]]; then
     # shellcheck disable=SC2206
     RUN_ARGS+=( --quant ${QUANTS_OVERRIDE} )
+fi
+if [[ -n "${ROUTING_GRAPH_LINE_SCALE}" ]]; then
+    RUN_ARGS+=( --line-scale "${ROUTING_GRAPH_LINE_SCALE}" )
 fi
 
 echo "============================================================"

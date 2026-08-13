@@ -46,8 +46,13 @@ QUANTS=("Q4_K_M")
 REBUILD=0
 REDOWNLOAD=0
 SKIP_PLOTS=0
+SKIP_ROUTING_GRAPHS=0
 USE_CUDA=0
 PRINT_USAGE=0
+# Per-routing-graph --line-scale. Tune to match the magnitude of your
+# pair counts: OLMoE (~1e7 pair counts) wants ~1e-4, Mixtral (~1e6) wants
+# ~1e-5. Empty means use the wrapper default (5e-7).
+LINE_SCALE="${ROUTING_GRAPH_LINE_SCALE:-}"
 
 declare -A STATUS=()
 
@@ -94,6 +99,20 @@ plotter_for() {
         humaneval) echo "${REPO_ROOT}/examples/eval-moe-humaneval/heatmap_from_cpp.py" ;;
         include)  echo "${REPO_ROOT}/examples/eval-moe-include/heatmap_from_cpp.py" ;;
         *) _die "plotter_for: unknown dataset '$1'" ;;
+    esac
+}
+
+# Short name -> matching integrated routing-graph renderer (added in the
+# coactivation patch; consumes the `aggregate` block emitted by the
+# updated C++ binary).
+routing_graph_for() {
+    case "$1" in
+        mmlu)     echo "${REPO_ROOT}/examples/eval-moe-mmlu/routing_graph_from_cpp.py" ;;
+        popqa)    echo "${REPO_ROOT}/examples/eval-moe-popqa/routing_graph_from_cpp.py" ;;
+        bigbench) echo "${REPO_ROOT}/examples/eval-moe-bigbench/routing_graph_from_cpp.py" ;;
+        humaneval) echo "${REPO_ROOT}/examples/eval-moe-humaneval/routing_graph_from_cpp.py" ;;
+        include)  echo "${REPO_ROOT}/examples/eval-moe-include/routing_graph_from_cpp.py" ;;
+        *) _die "routing_graph_for: unknown dataset '$1'" ;;
     esac
 }
 
@@ -167,6 +186,9 @@ Options:
   --rebuild                     force cmake --build even if binaries exist
   --redownload                  force re-download of every dataset
   --skip-plots                  skip heatmap_from_cpp.py invocation
+  --skip-routing-graphs         skip routing_graph_from_cpp.py invocation
+  --line-scale <float>          routing graph --line-scale override
+                                (default: 5e-7; tune to your pair count magnitude)
   --cuda                        enable CUDA build (passes -DGGML_CUDA=ON to cmake)
   --no-cuda                     disable CUDA build (default)
   -h, --help                    show this message and exit
@@ -175,11 +197,19 @@ Environment:
   EXTRA_CMAKE_FLAGS="..."        extra arguments forwarded to cmake configure
   CUDA_ARCHITECTURES="80;89"     forwarded as -DCMAKE_CUDA_ARCHITECTURES=<...>
                                  (only used when --cuda is set)
+  ROUTING_GRAPH_LINE_SCALE=<f>   equivalent to --line-scale <f>
 
 The hardcoded MODELS list is at the top of the script (DEFAULT_MODELS).
 The default quantization is Q4_K_M (see QUANTS= at the top of the script).
 
 Results tree: results/<model_safe>/<quant_safe>/moe-<dataset>/
+  ├── expert_counts.json    (C++ output: per-bucket + aggregate coactivation stats)
+  ├── run.log               (C++ stdout+stderr)
+  ├── plot.log              (heatmap_from_cpp.py stdout+stderr)
+  ├── routing.log           (routing_graph_from_cpp.py stdout+stderr)
+  ├── routing_heatmap*.png  (from heatmap_from_cpp.py)
+  ├── routing_graph.png     (from routing_graph_from_cpp.py)
+  └── metadata.json / counts_total.json (from heatmap_from_cpp.py)
 EOF
 }
 
@@ -213,6 +243,8 @@ parse_args() {
             --rebuild)          REBUILD=1; shift ;;
             --redownload)       REDOWNLOAD=1; shift ;;
             --skip-plots)       SKIP_PLOTS=1; shift ;;
+            --skip-routing-graphs)  SKIP_ROUTING_GRAPHS=1; shift ;;
+            --line-scale)       LINE_SCALE="$2"; shift 2 ;;
             --cuda)             USE_CUDA=1; shift ;;
             --no-cuda)          USE_CUDA=0; shift ;;
             -h|--help)          PRINT_USAGE=1; shift ;;
@@ -378,6 +410,7 @@ run_eval() {
     local out_dir="${RESULTS_DIR}/${safe}/${quant_safe}/moe-${ds}"
     local log="${out_dir}/run.log"
     local plot_log="${out_dir}/plot.log"
+    local routing_log="${out_dir}/routing.log"
     local json="${out_dir}/expert_counts.json"
     local binary; binary="$(binary_for "$ds")"
     local status_key="${model}|${quant}|${ds}"
@@ -388,6 +421,12 @@ run_eval() {
         if json_is_valid "$json"; then
         _log_info "(model=${model}, quant=${quant}, ds=${ds}) -> SKIPPED (${json} exists)"
         STATUS["${status_key}"]="SKIPPED"
+        # The C++ step was skipped, but the derived artifacts may still
+        # be missing on first run (or stale from a previous tool version).
+        # Always (re)run the routing-graph step unless explicitly disabled,
+        # since it's cheap and idempotent. We DON'T re-render heatmaps here
+        # because that's the pre-existing convention.
+        _render_routing_graph "$model" "$quant" "$ds" "$json" "$routing_log"
         return 0
         fi
         _log_warn "(model=${model}, quant=${quant}, ds=${ds}) existing ${json} is invalid; regenerating"
@@ -431,6 +470,29 @@ run_eval() {
                 >"$plot_log" 2>&1; then
             _log_warn "(model=${model}, quant=${quant}, ds=${ds}) plot failed; log: ${plot_log}"
         fi
+    fi
+
+    if [[ $SKIP_ROUTING_GRAPHS -eq 0 ]]; then
+        _render_routing_graph "$model" "$quant" "$ds" "$json" "$routing_log"
+    fi
+}
+
+# Helper used by both the SKIPPED and the freshly-evaluated paths in
+# run_eval(). Renders the routing graph from an existing expert_counts.json.
+# No-op if --skip-routing-graphs was set. Writes to $routing_log; caller
+# is responsible for declaring that variable.
+_render_routing_graph() {
+    local model="$1" quant="$2" ds="$3" json="$4" routing_log="$5"
+    [[ $SKIP_ROUTING_GRAPHS -eq 0 ]] || return 0
+    local rg; rg="$(routing_graph_for "$ds")"
+    _log_info "(model=${model}, quant=${quant}, ds=${ds}) rendering routing graph ..."
+    local -a RG_FLAGS=( -i "$json" )
+    if [[ -n "${LINE_SCALE}" ]]; then
+        RG_FLAGS+=( --line-scale "${LINE_SCALE}" )
+    fi
+    if ! python3 "$rg" "${RG_FLAGS[@]}" \
+            >"$routing_log" 2>&1; then
+        _log_warn "(model=${model}, quant=${quant}, ds=${ds}) routing graph failed; log: ${routing_log}"
     fi
 }
 
@@ -484,7 +546,7 @@ main() {
     _log_info "MODELS (${#MODELS[@]})       = ${MODELS[*]}"
     _log_info "DATASETS (${#DATASETS[@]})     = ${DATASETS[*]}"
     _log_info "QUANTS (${#QUANTS[@]})       = ${QUANTS[*]}"
-    _log_info "REBUILD=${REBUILD}, REDOWNLOAD=${REDOWNLOAD}, SKIP_PLOTS=${SKIP_PLOTS}, USE_CUDA=${USE_CUDA}"
+    _log_info "REBUILD=${REBUILD}, REDOWNLOAD=${REDOWNLOAD}, SKIP_PLOTS=${SKIP_PLOTS}, SKIP_ROUTING_GRAPHS=${SKIP_ROUTING_GRAPHS}, USE_CUDA=${USE_CUDA}, ROUTING_GRAPH_LINE_SCALE=${LINE_SCALE:-<default 5e-7>}"
     echo "============================================================"
 
     echo "============================================================"

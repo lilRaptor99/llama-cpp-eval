@@ -131,8 +131,8 @@ python examples/eval-moe-mmlu/heatmap_from_cpp.py -i build/moe-mmlu/expert_count
 # One integrated routing graph: experts as circles on a decoupled grid (rows
 # spaced wider than columns), linear Blues fill for marginal activation,
 # lines (thickness ∝ raw count) for the top-K adjacent-layer pairs per layer
-# pair, and a cyan ring on experts in the top 12.5% of BOTH marginal firing
-# count AND outgoing pair-sum.
+# pair, and a thick red ring on the top 12.5% of experts per layer (selection
+# rule controlled by --highlight-mode; default: marginal ∩ outgoing-pair-sum).
 python examples/eval-moe-mmlu/routing_graph_from_cpp.py -i build/moe-mmlu/expert_counts.json
 ```
 
@@ -151,19 +151,23 @@ The second script produces:
 
 `routing_graph_from_cpp.py` accepts optional flags for the visual encoding:
 
-| Flag                    | Default                         | Meaning                                                                                                                                                                  |
-| ----------------------- | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `-o, --output <path>`   | `<input_dir>/routing_graph.png` | output PNG path                                                                                                                                                          |
-| `--col-spacing <float>` | `1.0`                           | horizontal distance between expert columns in data units (also controls circle radius)                                                                                   |
-| `--row-spacing <float>` | `2.5`                           | vertical distance between layer rows in data units. Increase to make the cross-layer connection lines more visible.                                                      |
-| `--top-k <int>`         | `64`                            | top-K adjacent-layer pairs to draw per layer pair (capped at E²)                                                                                                         |
-| `--top-frac <float>`    | `0.125`                         | fraction of experts per layer to highlight with a cyan ring (experts in BOTH the top top_frac-by-marginal AND top top_frac-by-outgoing-pair-sum). Set to `0` to disable. |
-| `--line-scale <float>`  | `5e-7`                          | line width = `0.1 + line_scale * raw_count` (tune to your count magnitude; OLMoE-scale ≈ `1e-4`, Mixtral-scale ≈ `1e-5`)                                                 |
+| Flag                      | Default                         | Meaning                                                                                                                                                                                   |
+| ------------------------- | ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `-o, --output <path>`     | `<input_dir>/routing_graph.png` | output PNG path                                                                                                                                                                           |
+| `--col-spacing <float>`   | `1.0`                           | horizontal distance between expert columns in data units (also controls circle radius)                                                                                                    |
+| `--row-spacing <float>`   | `2.5`                           | vertical distance between layer rows in data units. Increase to make the cross-layer connection lines more visible.                                                                       |
+| `--top-k <int>`           | `64`                            | top-K adjacent-layer pairs to draw per layer pair (capped at E²)                                                                                                                          |
+| `--top-frac <float>`      | `0.125`                         | fraction of experts per layer to highlight with a red ring. Set to `0` to disable.                                                                                                        |
+| `--highlight-mode <mode>` | `pair`                          | highlight selection rule: `pair` (default — intersection of top by marginal AND top by outgoing pair-sum), `marginal` (top by marginal only), `pair-sum` (top by outgoing pair-sum only). |
+| `--line-scale <float>`    | `5e-7`                          | line width = `0.1 + line_scale * raw_count` (tune to your count magnitude; OLMoE-scale ≈ `1e-4`, Mixtral-scale ≈ `1e-5`)                                                                  |
 
 The visual encoding is:
 
 - **Circles**: one per `(layer, expert)` on a simple grid; fill colour encodes marginal firing count linearly (Blues: white = 0, dark blue = max). The colorbar is labelled "Token Processing Load" and shows values in millions (e.g. `40.0M`).
-- **Highlight rings**: experts in BOTH the top-12.5%-by-marginal AND top-12.5%-by-outgoing-pair-sum for their layer get a thick cyan ring. These are the experts that are both heavily fired AND heavily involved in cross-layer routing.
+- **Highlight rings**: a thick red ring (`#ff1744`, linewidth 4.0) is drawn on experts selected by `--highlight-mode`:
+    - `pair` (default): experts in BOTH the top-12.5%-by-marginal AND top-12.5%-by-outgoing-pair-sum for their layer — the experts that are both heavily fired AND heavily involved in cross-layer routing.
+    - `marginal`: top-12.5%-by-marginal firing count only — the most-used experts per layer.
+    - `pair-sum`: top-12.5%-by-outgoing-pair-sum only — the experts with the highest cross-layer routing footprint.
 - **Lines**: connect adjacent-layer `(L, L+1)` expert pairs; only the top-K pairs by raw count per layer pair are drawn. Line thickness is proportional to the raw count (no per-layer normalisation), so absolute routing volume is comparable across the figure.
 - **Row spacing** is deliberately larger than column spacing (default 2.5 vs 1.0) so the cross-layer connection lines have a clearly visible vertical distance to traverse.
 - **Axis labels**: "Layer Index" (vertical) and "Expert Index (within same layer)" (horizontal).

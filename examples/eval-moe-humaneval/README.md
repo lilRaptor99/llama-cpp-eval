@@ -155,14 +155,31 @@ quick routing sanity checks without paying the decode cost.)
 ## Visualize
 
 ```sh
+# Four 2D heatmaps: layer×expert overview + per-task + per-task-normalised,
+# in both raw and row-normalised forms.
 python examples/eval-moe-humaneval/heatmap_from_cpp.py -i build/moe-humaneval/expert_counts.json
+
+# One integrated routing graph: experts as hex-packed circles, linear
+# Blues fill for marginal activation, lines (thickness ∝ raw count) for the
+# top-K adjacent-layer pairs per layer pair, and a thick red ring on the
+# top 12.5% of experts per layer (selection rule controlled by
+# --highlight-mode; default: marginal ∩ outgoing-pair-sum).
+python examples/eval-moe-humaneval/routing_graph_from_cpp.py -i build/moe-humaneval/expert_counts.json
 ```
 
-This writes `routing_heatmap.png` (per-token activation rate overview,
-L×E), `routing_heatmap_by_task.png` (164 problems in a `sqrt(164)` ×
-`sqrt(164)` grid of small L×E heatmaps, log1p color), and
+The first script writes `routing_heatmap.png` (per-token activation rate
+overview, L×E), `routing_heatmap_by_task.png` (164 problems in a
+`sqrt(164)` × `sqrt(164)` grid of small L×E heatmaps, log1p color), and
 `routing_heatmap_by_task_normalized.png` (same layout, row-normalized),
 plus `metadata.json` and `counts_total.json` for downstream tooling.
+
+The second script writes `routing_graph.png` (integrated graph; overwrite
+with `-o`). It consumes the `aggregate` block from the updated C++ binary
+(marginal `[L, E]` + intra `[L, E, E]` + adjacent `[L-1, E, E]` pair counts).
+CLI flags and rendering are documented in
+[`examples/_shared/moe_routing_graph.py`](../_shared/moe_routing_graph.py)
+(`--col-spacing`, `--row-spacing`, `--top-k`, `--top-frac`,
+`--highlight-mode {pair,marginal,pair-sum}`, `--line-scale`).
 
 There is **no accuracy / match-rate plot** by design -- the tool never
 scores generated code for correctness.

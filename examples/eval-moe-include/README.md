@@ -103,10 +103,19 @@ Quick smoke test (1 test question per langdom, 0-shot, prompt-only):
 ## Visualize
 
 ```sh
+# 2D heatmaps: layer×expert overview + per-language / per-domain / per-
+# (lang, dom) breakdowns in both raw and row-normalised forms.
 python examples/eval-moe-include/heatmap_from_cpp.py -i build/moe-include/expert_counts.json
+
+# One integrated routing graph: experts as hex-packed circles, linear
+# Blues fill for marginal activation, lines (thickness ∝ raw count) for the
+# top-K adjacent-layer pairs per layer pair, and a thick red ring on the
+# top 12.5% of experts per layer (selection rule controlled by
+# --highlight-mode; default: marginal ∩ outgoing-pair-sum).
+python examples/eval-moe-include/routing_graph_from_cpp.py -i build/moe-include/expert_counts.json
 ```
 
-This writes:
+The first script writes:
 
 - `routing_heatmap.png` layer x expert overview
 - `routing_heatmap_by_language.png` ~44 languages x (L·E) cells (log1p)

@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 # type: ignore
 
-"""Render an integrated routing-graph from the C++ `llama-eval-moe-mmlu` JSON.
+"""Shared MoE routing-graph rendering library for the eval-moe-* tools.
 
-Reads `expert_counts.json` produced by the updated `llama-eval-moe-mmlu`
-(which emits the `aggregate` block: marginal firing counts + adjacent-layer
-pair counts). Writes a single integrated PNG:
+Consumed by `examples/eval-moe-{mmlu,bigbench,humaneval,popqa,include}/routing_graph_from_cpp.py`.
+Each per-dataset wrapper is a thin CLI that calls `run_main()` with its
+dataset name.
+
+Reads `expert_counts.json` produced by the updated C++ eval (which emits the
+`aggregate` block: marginal firing counts + adjacent-layer pair counts).
+Writes a single integrated PNG:
 
     routing_graph.png
 
@@ -83,7 +87,7 @@ def load_aggregate(path: Path) -> dict:
     Returns a dict with keys: L, E, k, arch, marginal, adj.
 
     Aborts with sys.exit if the JSON lacks the `aggregate` block (i.e. was
-    produced by an older eval-moe-mmlu binary without the coactivation patch).
+    produced by an older eval-moe-* binary without the coactivation patch).
     """
     with open(path) as fh:
         d = json.load(fh)
@@ -97,8 +101,8 @@ def load_aggregate(path: Path) -> dict:
         sys.exit(
             "error: input JSON missing `aggregate` block.\n"
             "       this tool requires the C++ `aggregate` block emitted by the\n"
-            "       updated eval-moe-mmlu binary (with co-activation capture).\n"
-            "       re-run your eval with the rebuilt llama-eval-moe-mmlu."
+            "       updated eval-moe-* binary (with co-activation capture).\n"
+            "       re-run your eval with the rebuilt llama-eval-moe-<dataset>."
         )
 
     marginal = np.array(agg.get("marginal_expert_counts"), dtype=np.int64)
@@ -260,6 +264,7 @@ def draw_routing_graph(
     row_spacing: float,
     line_scale: float,
     path: Path,
+    title_prefix: str = "Integrated routing graph",
 ) -> None:
     """Render the integrated routing graph to `path`.
 
@@ -267,10 +272,13 @@ def draw_routing_graph(
     spacing > col spacing so the lines connecting adjacent-layer experts
     have a clearly visible vertical distance to traverse. Circles are filled
     with linearly-scaled marginal firing count (Blues, no log scale).
-    "Top co-activated" experts (in `highlight`) get a thick cyan ring.
+    "Top co-activated" experts (in `highlight`) get a thick red ring.
     Lines connect top-K adjacent-layer (L, L+1) pairs by raw count; line
     thickness is proportional to raw count (no per-layer normalisation).
     A colourbar on the right encodes the marginal firing rate.
+
+    `title_prefix` lets per-dataset wrappers add context (e.g. "(per-task)")
+    to the auto-generated title without duplicating the rest of the title.
     """
     L, E = marginal.shape
     pos = grid_positions(L, E, col_spacing, row_spacing)
@@ -305,7 +313,7 @@ def draw_routing_graph(
             )
             ax.add_patch(circ)
 
-    # ---- highlight rings: redraw on top, cyan outline ----
+    # ---- highlight rings: redraw on top, red outline ----
     for L_ in range(L):
         for e in highlight[L_]:
             x, y = pos[L_, e]
@@ -392,7 +400,7 @@ def draw_routing_graph(
 
     # ---- title ----
     ax.set_title(
-        f"Integrated routing graph ({L} layers × {E} experts, "
+        f"{title_prefix} ({L} layers × {E} experts, "
         f"top {K} adjacent-layer pairs drawn)",
         fontsize=11, pad=14,
     )
@@ -406,13 +414,9 @@ def draw_routing_graph(
 # ============================================================ CLI glue
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Render the integrated routing-graph PNG from a llama-eval-moe-mmlu "
-            "JSON. Consumes the aggregate block (marginal + adjacent pair counts)."
-        ),
-    )
+def build_arg_parser(description: str) -> argparse.ArgumentParser:
+    """Build the standard argparse for all per-dataset routing-graph wrappers."""
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument(
         "-i", "--input", required=True, type=Path,
         help="path to expert_counts.json (must have an `aggregate` block)",
@@ -466,11 +470,27 @@ def main() -> None:
             f"Tune to match the magnitude of your counts (default: {DEFAULT_LINE_WIDTH_SCALE:.0e})"
         ),
     )
-    args = parser.parse_args()
+    return parser
+
+
+def run_main(dataset_label: str, args: argparse.Namespace | None = None) -> None:
+    """Run the standard routing-graph pipeline for any eval-moe-* dataset.
+
+    `dataset_label` is shown in the banner (e.g. "mmlu", "popqa"). If
+    `args` is None, parse from `sys.argv`.
+    """
+    if args is None:
+        parser = build_arg_parser(
+            description=(
+                f"Render the integrated routing-graph PNG for the {dataset_label} eval. "
+                "Consumes the aggregate block (marginal + adjacent pair counts)."
+            )
+        )
+        args = parser.parse_args()
 
     data = load_aggregate(args.input)
     L, E, k, arch = data["L"], data["E"], data["k"], data["arch"]
-    print(f"[load] input = {args.input}")
+    print(f"[load] dataset={dataset_label} input = {args.input}")
     print(f"[load] arch={arch} L={L} E={E}, k={k}")
 
     if L < 2:
@@ -512,10 +532,7 @@ def main() -> None:
         row_spacing=args.row_spacing,
         line_scale=args.line_scale,
         path=out_path,
+        title_prefix=f"Integrated routing graph ({dataset_label})",
     )
     print(f"[save] {out_path}")
     print("[done]")
-
-
-if __name__ == "__main__":
-    main()

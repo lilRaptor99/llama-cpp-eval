@@ -144,13 +144,30 @@ quick routing sanity checks without paying the decode cost.)
 ## Visualize
 
 ```sh
+# Four 2D heatmaps: layer×expert overview + per-task + per-task-normalised,
+# in both raw and row-normalised forms.
 python examples/eval-moe-bigbench/heatmap_from_cpp.py -i build/moe-bigbench/expert_counts.json
+
+# One integrated routing graph: experts as hex-packed circles, linear
+# Blues fill for marginal activation, lines (thickness ∝ raw count) for the
+# top-K adjacent-layer pairs per layer pair, and a thick red ring on the
+# top 12.5% of experts per layer (selection rule controlled by
+# --highlight-mode; default: marginal ∩ outgoing-pair-sum).
+python examples/eval-moe-bigbench/routing_graph_from_cpp.py -i build/moe-bigbench/expert_counts.json
 ```
 
-This writes `routing_heatmap.png` (per-token activation rate overview),
-`routing_heatmap_by_task.png` (27 tasks x L·E cells, log1p), and
+The first script writes `routing_heatmap.png` (per-token activation rate
+overview), `routing_heatmap_by_task.png` (27 tasks x L·E cells, log1p), and
 `accuracy_by_task.png` (per-task exact-match accuracy bars), plus
 `metadata.json` and `counts_total.json` for downstream tooling.
+
+The second script writes `routing_graph.png` (integrated graph; overwrite
+with `-o`). It consumes the `aggregate` block from the updated C++ binary
+(marginal `[L, E]` + intra `[L, E, E]` + adjacent `[L-1, E, E]` pair counts).
+CLI flags and rendering are documented in
+[`examples/_shared/moe_routing_graph.py`](../_shared/moe_routing_graph.py)
+(`--col-spacing`, `--row-spacing`, `--top-k`, `--top-frac`,
+`--highlight-mode {pair,marginal,pair-sum}`, `--line-scale`).
 
 ## Output schema
 

@@ -40,8 +40,8 @@ python examples/eval-moe-popqa/download_popqa.py
 
 This writes:
 
-- `build/moe-popqa/popqa.jsonl`    one record per question
-- `build/moe-popqa/props.txt`      one `prop` (relation type) per line, ~16
+- `build/moe-popqa/popqa.jsonl` one record per question
+- `build/moe-popqa/props.txt` one `prop` (relation type) per line, ~16
 
 Pass `--props <list>` to restrict to a subset, `--limit N` to subsample evenly
 across props.
@@ -59,13 +59,13 @@ across props.
 All standard llama.cpp flags are accepted (`-ngl`, `-c`, `--seed`, `-t`, ...).
 The tool-specific options are:
 
-| Flag | Meaning | Default |
-|---|---|---|
-| `--popqa <path>` | `popqa.jsonl` | `build/moe-popqa/popqa.jsonl` |
-| `--props <path>` | props list | `build/moe-popqa/props.txt` |
-| `--questions-per-prop N` | questions per relation type | 50 |
-| `--gen-tokens N` | autoregressive decode cap (0 = prompt-only) | 16 |
-| `-o, --output <path>` | output JSON | `build/moe-popqa/expert_counts.json` |
+| Flag                     | Meaning                                     | Default                              |
+| ------------------------ | ------------------------------------------- | ------------------------------------ |
+| `--popqa <path>`         | `popqa.jsonl`                               | `build/moe-popqa/popqa.jsonl`        |
+| `--props <path>`         | props list                                  | `build/moe-popqa/props.txt`          |
+| `--questions-per-prop N` | questions per relation type                 | 50                                   |
+| `--gen-tokens N`         | autoregressive decode cap (0 = prompt-only) | 16                                   |
+| `-o, --output <path>`    | output JSON                                 | `build/moe-popqa/expert_counts.json` |
 
 > **Note.** PopQA's HF dataset ships with a single `test` split (14,267 rows).
 > There is no dev split, so this tool runs **zero-shot only**; there is no
@@ -83,9 +83,25 @@ Quick smoke test (1 question/prop, prompt-only):
 ## Visualize
 
 ```sh
+# 2D heatmaps: layer×expert overview + per-prop + match-rate bars.
 python examples/eval-moe-popqa/heatmap_from_cpp.py -i build/moe-popqa/expert_counts.json
+
+# One integrated routing graph: experts as hex-packed circles, linear
+# Blues fill for marginal activation, lines (thickness ∝ raw count) for the
+# top-K adjacent-layer pairs per layer pair, and a thick red ring on the
+# top 12.5% of experts per layer (selection rule controlled by
+# --highlight-mode; default: marginal ∩ outgoing-pair-sum).
+python examples/eval-moe-popqa/routing_graph_from_cpp.py -i build/moe-popqa/expert_counts.json
 ```
 
-This writes `routing_heatmap.png` (per-token activation rate overview),
-`routing_heatmap_by_prop.png` (16 rows x L·E cells, log1p), and
+The first script writes `routing_heatmap.png` (per-token activation rate
+overview), `routing_heatmap_by_prop.png` (16 rows x L·E cells, log1p), and
 `match_rate_by_prop.png` (per-prop substring-match accuracy bars).
+
+The second script writes `routing_graph.png` (integrated graph; overwrite
+with `-o`). It consumes the `aggregate` block from the updated C++ binary
+(marginal `[L, E]` + intra `[L, E, E]` + adjacent `[L-1, E, E]` pair counts).
+CLI flags and rendering are documented in
+[`examples/_shared/moe_routing_graph.py`](../_shared/moe_routing_graph.py)
+(`--col-spacing`, `--row-spacing`, `--top-k`, `--top-frac`,
+`--highlight-mode {pair,marginal,pair-sum}`, `--line-scale`).

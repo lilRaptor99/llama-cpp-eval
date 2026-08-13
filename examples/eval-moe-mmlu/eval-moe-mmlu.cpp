@@ -55,9 +55,25 @@ struct moe_accumulator {
     std::string current_subject;
 
     // per subject: subject -> vector<vector<int64_t>> of size [n_layer][n_expert]
-    std::map<std::string, std::vector<std::vector<int64_t>>> counts;
+    std::map<std::string, std::vector<std::vector<int64_t>>>              counts;
+    // per subject: subject -> vector<vector<vector<int64_t>>> [n_layer][n_expert][n_expert]
+    // intra_pair_counts[subj][L][e_i][e_j] = # tokens where both e_i and e_j fired
+    //                                       in the top-k of layer L (k * k slots).
+    std::map<std::string, std::vector<std::vector<std::vector<int64_t>>>> intra_counts;
+    // per subject: subject -> vector<vector<vector<int64_t>>> [n_layer - 1][n_expert][n_expert]
+    // adj_pair_counts[subj][L][e_i][e_j] = # tokens t such that e_i fired in layer L at t
+    //                                     AND e_j fired in layer L + 1 at t (k * k slots).
+    // Layer index n_layer - 1 is omitted (no L + 1 exists).
+    std::map<std::string, std::vector<std::vector<std::vector<int64_t>>>> adj_counts;
     // per subject: subject -> number of forward-passed tokens
-    std::map<std::string, int64_t>                           tokens;
+    std::map<std::string, int64_t>                                        tokens;
+
+    // Slice buffer: current_topk[il] holds the raw top-k expert IDs (stride1 = n_expert,
+    // not k) for the current decode. Populated by moe_eval_callback; consumed by
+    // tally_pairs_for_question() right after llama_decode() returns.
+    // current_topk[il].size() = stride1 * n_tokens for the current decode.
+    std::vector<std::vector<int32_t>> current_topk;
+    int                               current_n_tokens = 0;
 
     // expose shape on first capture so we can validate later tensors
     int seen_k = -1;
@@ -136,7 +152,106 @@ static bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data
         }
     }
 
+    // Also copy the raw top-k into the per-decode slice buffer so
+    // tally_pairs_for_question() can compute intra- and adjacent-layer pair
+    // counts position-aligned across layers. This duplicates the tensor copy
+    // but avoids changing the marginal-tally hot path's stride math.
+    // current_topk[il] has stride1 = n_expert elements per token (interleaved
+    // gaps), matching the ggml_view layout.
+    if ((int) g_acc.current_topk.size() != g_acc.n_layer) {
+        g_acc.current_topk.assign(g_acc.n_layer, std::vector<int32_t>());
+    }
+    if (g_acc.current_topk[il].size() != buf_elems) {
+        g_acc.current_topk[il].resize(buf_elems);
+    }
+    std::memcpy(g_acc.current_topk[il].data(), buf.data(), buf_elems * sizeof(int32_t));
+    if (g_acc.current_n_tokens < ntok) {
+        g_acc.current_n_tokens = ntok;
+    }
+
     return true;
+}
+
+// Walks the per-decode slice buffer (filled by moe_eval_callback) and tallies
+// intra-layer [L, E, E] and adjacent-layer [L - 1, E, E] pair counts for the
+// current subject. Each token contributes k * k increments per layer pair
+// (one for each (j1, j2) top-k slot pair). Must be called after every
+// llama_decode() and before llama_memory_clear().
+static void tally_pairs_for_question(moe_accumulator & acc) {
+    const int    n_layer  = acc.n_layer;
+    const int    n_expert = acc.n_expert;
+    const int    ntok     = acc.current_n_tokens;
+    const size_t stride1  = (size_t) n_expert;  // slice layout: n_expert per token
+
+    if (ntok <= 0 || n_layer <= 0) {
+        return;
+    }
+    if ((int) acc.current_topk.size() != n_layer) {
+        LOG_WRN("%s: current_topk size %zu != n_layer %d - skipping\n", __func__, acc.current_topk.size(), n_layer);
+        return;
+    }
+
+    auto get = [&](int L, int tok, int j) -> int32_t {
+        const auto & layer = acc.current_topk[L];
+        return layer[(size_t) tok * stride1 + (size_t) j];
+    };
+
+    const std::string & subj  = acc.current_subject;
+    auto &              intra = acc.intra_counts[subj];
+    auto &              adj   = acc.adj_counts[subj];
+
+    // Intra-layer: for each layer L, for each token t, walk all (j1, j2) top-k
+    // slot pairs from the same layer's slice.
+    for (int L = 0; L < n_layer; ++L) {
+        if ((int) intra.size() <= L) {
+            continue;  // subject was skipped (no test rows)
+        }
+        auto & layer_intra = intra[L];
+        for (int tok = 0; tok < ntok; ++tok) {
+            for (int j1 = 0; j1 < acc.n_expert_k; ++j1) {
+                const int32_t e1 = get(L, tok, j1);
+                if (e1 < 0 || e1 >= n_expert) {
+                    continue;
+                }
+                for (int j2 = 0; j2 < acc.n_expert_k; ++j2) {
+                    const int32_t e2 = get(L, tok, j2);
+                    if (e2 < 0 || e2 >= n_expert) {
+                        continue;
+                    }
+                    layer_intra[e1][e2] += 1;
+                }
+            }
+        }
+    }
+
+    // Adjacent-layer: position-aligned across (L, L + 1). Skip if n_layer < 2.
+    if (n_layer >= 2 && (int) adj.size() >= n_layer - 1) {
+        for (int L = 0; L < n_layer - 1; ++L) {
+            auto & layer_adj = adj[L];
+            for (int tok = 0; tok < ntok; ++tok) {
+                for (int j1 = 0; j1 < acc.n_expert_k; ++j1) {
+                    const int32_t e1 = get(L, tok, j1);
+                    if (e1 < 0 || e1 >= n_expert) {
+                        continue;
+                    }
+                    for (int j2 = 0; j2 < acc.n_expert_k; ++j2) {
+                        const int32_t e2 = get(L + 1, tok, j2);
+                        if (e2 < 0 || e2 >= n_expert) {
+                            continue;
+                        }
+                        layer_adj[e1][e2] += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Release the per-decode slice buffer immediately to bound memory at
+    // ~n_layer * stride1 * ntok * 4 bytes (~30-60 KB for OLMoE prefill).
+    acc.current_n_tokens = 0;
+    for (auto & layer : acc.current_topk) {
+        std::vector<int32_t>().swap(layer);
+    }
 }
 
 // ------------------------------------------------------------------- JSON I/O
@@ -200,6 +315,19 @@ static void write_json_2d_int_array(FILE * f, const std::vector<std::vector<int6
         std::fputc('\n', f);
         std::fputc(' ', f);
         write_json_int_array(f, m[i]);
+    }
+    std::fputc(']', f);
+}
+
+static void write_json_3d_int_array(FILE * f, const std::vector<std::vector<std::vector<int64_t>>> & m) {
+    std::fputc('[', f);
+    for (size_t i = 0; i < m.size(); ++i) {
+        if (i > 0) {
+            std::fputc(',', f);
+        }
+        std::fputc('\n', f);
+        std::fputc(' ', f);
+        write_json_2d_int_array(f, m[i]);
     }
     std::fputc(']', f);
 }
@@ -631,6 +759,14 @@ int main(int argc, char ** argv) {
     // -------- pre-allocate per-subject count matrices
     for (const auto & subj : subjects) {
         g_acc.counts[subj].assign(g_acc.n_layer, std::vector<int64_t>(g_acc.n_expert, 0));
+        g_acc.intra_counts[subj].assign(
+            g_acc.n_layer, std::vector<std::vector<int64_t>>(g_acc.n_expert, std::vector<int64_t>(g_acc.n_expert, 0)));
+        // Adjacent has n_layer - 1 entries (no L + 1 for the last layer).
+        if (g_acc.n_layer >= 2) {
+            g_acc.adj_counts[subj].assign(
+                g_acc.n_layer - 1,
+                std::vector<std::vector<int64_t>>(g_acc.n_expert, std::vector<int64_t>(g_acc.n_expert, 0)));
+        }
         g_acc.tokens[subj] = 0;
     }
 
@@ -733,6 +869,13 @@ int main(int argc, char ** argv) {
                 continue;
             }
 
+            // After every layer's ffn_moe_topk-<il> has been filled into
+            // g_acc.current_topk, walk it once to tally intra-layer and
+            // adjacent-layer pair counts. Done on the main thread so we
+            // don't race with the scheduler callback (which fired
+            // synchronously inside llama_decode above).
+            tally_pairs_for_question(g_acc);
+
             g_acc.tokens[subj] += (int64_t) toks.size();
             total_questions++;
 
@@ -803,6 +946,67 @@ int main(int argc, char ** argv) {
     std::fprintf(fout, "    \"questions_total\": %d,\n", total_questions);
     std::fprintf(fout, "    \"tokens_total\": %lld\n", (long long) total_tokens);
     std::fprintf(fout, "  },\n");
+
+    // ---- aggregate: sum per-subject matrices into a dataset-wide view.
+    // Schema mirrors the per-subject keys but uses `marginal_expert_counts`
+    // for clarity (per-subject keeps `layer_expert_counts` for backward
+    // compatibility with heatmap_from_cpp.py).
+    std::vector<std::vector<int64_t>> marginal_total(g_acc.n_layer, std::vector<int64_t>(g_acc.n_expert, 0));
+    std::vector<std::vector<std::vector<int64_t>>> intra_total;
+    std::vector<std::vector<std::vector<int64_t>>> adj_total;
+    if (g_acc.n_layer > 0) {
+        intra_total.assign(g_acc.n_layer,
+                           std::vector<std::vector<int64_t>>(g_acc.n_expert, std::vector<int64_t>(g_acc.n_expert, 0)));
+        if (g_acc.n_layer >= 2) {
+            adj_total.assign(g_acc.n_layer - 1, std::vector<std::vector<int64_t>>(
+                                                    g_acc.n_expert, std::vector<int64_t>(g_acc.n_expert, 0)));
+        }
+    }
+    for (const auto & kv : g_acc.counts) {
+        const auto & subj_name = kv.first;
+        const auto & mat       = kv.second;
+        if (mat.empty()) {
+            continue;
+        }
+        // sum marginals
+        for (int L = 0; L < g_acc.n_layer; ++L) {
+            for (int e = 0; e < g_acc.n_expert; ++e) {
+                marginal_total[L][e] += mat[L][e];
+            }
+        }
+        // sum intra-pair
+        const auto & intra_it = g_acc.intra_counts.find(subj_name);
+        if (intra_it != g_acc.intra_counts.end() && (int) intra_it->second.size() == g_acc.n_layer) {
+            for (int L = 0; L < g_acc.n_layer; ++L) {
+                for (int e1 = 0; e1 < g_acc.n_expert; ++e1) {
+                    for (int e2 = 0; e2 < g_acc.n_expert; ++e2) {
+                        intra_total[L][e1][e2] += intra_it->second[L][e1][e2];
+                    }
+                }
+            }
+        }
+        // sum adjacent-pair
+        const auto & adj_it = g_acc.adj_counts.find(subj_name);
+        if (adj_it != g_acc.adj_counts.end() && (int) adj_it->second.size() == g_acc.n_layer - 1) {
+            for (int L = 0; L < g_acc.n_layer - 1; ++L) {
+                for (int e1 = 0; e1 < g_acc.n_expert; ++e1) {
+                    for (int e2 = 0; e2 < g_acc.n_expert; ++e2) {
+                        adj_total[L][e1][e2] += adj_it->second[L][e1][e2];
+                    }
+                }
+            }
+        }
+    }
+
+    std::fprintf(fout, "  \"aggregate\": {\n");
+    std::fprintf(fout, "    \"marginal_expert_counts\": ");
+    write_json_2d_int_array(fout, marginal_total);
+    std::fprintf(fout, ",\n    \"intra_pair_counts\": ");
+    write_json_3d_int_array(fout, intra_total);
+    std::fprintf(fout, ",\n    \"adjacent_pair_counts\": ");
+    write_json_3d_int_array(fout, adj_total);
+    std::fprintf(fout, "\n  },\n");
+
     std::fprintf(fout, "  \"subjects\": {\n");
 
     bool first_subj = true;
@@ -824,6 +1028,17 @@ int main(int argc, char ** argv) {
         std::fprintf(fout, "      \"n_tokens\": %lld,\n", (long long) g_acc.tokens[subj_name]);
         std::fprintf(fout, "      \"layer_expert_counts\": ");
         write_json_2d_int_array(fout, layer_counts);
+
+        const auto & intra_it = g_acc.intra_counts.find(subj_name);
+        if (intra_it != g_acc.intra_counts.end() && (int) intra_it->second.size() == g_acc.n_layer) {
+            std::fprintf(fout, ",\n      \"intra_pair_counts\": ");
+            write_json_3d_int_array(fout, intra_it->second);
+        }
+        const auto & adj_it = g_acc.adj_counts.find(subj_name);
+        if (adj_it != g_acc.adj_counts.end() && (int) adj_it->second.size() == g_acc.n_layer - 1) {
+            std::fprintf(fout, ",\n      \"adjacent_pair_counts\": ");
+            write_json_3d_int_array(fout, adj_it->second);
+        }
         std::fprintf(fout, "\n    }");
     }
 

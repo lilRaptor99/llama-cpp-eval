@@ -67,9 +67,10 @@
 #   DATASETS_OVERRIDE   subset of {mmlu,popqa,bigbench,humaneval,include}
 #                                                   (default: all 5)
 #   QUANTS_OVERRIDE     quants to run                (default: Q4_K_M)
-#   JACCARD_SWEEP_SKIP  skip the per-cell jaccard K-sweep post-step
-#                                                    (default: 0 = run;
-#                                                     1 = skip entirely)
+#   SKIP_PYTHON_PLOTS   master switch for ALL python post-processing
+#                       (per-cell heatmap, routing graph, jaccard K-sweep)
+#                                                    (default: 1 = SKIP all;
+#                                                     0 = run all of them)
 #   HF_TOKEN            optional, for gated repos    (default: unset)
 
 # ---------------------------------------------------------------- SLURM
@@ -143,7 +144,13 @@ mkdir -p "${BUILD_DIR}" "${DATASETS_DIR}" "${RESULTS_DIR}" "${HF_CACHE}"
 : "${QUANTS_OVERRIDE:=Q4_K_M}"  # default quant
 : "${EXTRA_CMAKE_FLAGS:=}"
 : "${ROUTING_GRAPH_LINE_SCALE:=}" # empty = use routing_graph_from_cpp.py default (5e-7)
-: "${JACCARD_SWEEP_SKIP:=}"     # empty/0 = run per-cell jaccard K-sweep post-step; 1 = skip
+: "${SKIP_PYTHON_PLOTS:=1}"     # 1 = skip ALL python post-processing (plots,
+                                 #     routing graphs, jaccard sweep);
+                                 # 0 = run all of them. Default 1 because
+                                 #     on a 4-day HPC budget we usually
+                                 #     just want the JSON + the per-cell
+                                 #     log; the visualisations are run
+                                 #     out-of-band on the login node.
 
 # ---------------------------------------------------------------- banner
 echo "============================================================"
@@ -427,6 +434,14 @@ fi
 if [[ -n "${ROUTING_GRAPH_LINE_SCALE}" ]]; then
     RUN_ARGS+=( --line-scale "${ROUTING_GRAPH_LINE_SCALE}" )
 fi
+# SKIP_PYTHON_PLOTS=1 (default) disables every Python plotting step:
+#   - heatmap_from_cpp.py (per-cell routing heatmaps)
+#   - routing_graph_from_cpp.py (per-cell integrated routing graph)
+#   - jaccard_sweep_from_cpp.py (per-cell Jaccard K-sweep, run below)
+# When set to 0, all three run as before.
+if [[ "${SKIP_PYTHON_PLOTS:-1}" -eq 1 ]]; then
+    RUN_ARGS+=( --skip-plots --skip-routing-graphs )
+fi
 
 echo "============================================================"
 echo "[$(date -Iseconds)] running: bash scripts/run-evaluator.sh ${RUN_ARGS[*]}"
@@ -441,7 +456,9 @@ bash scripts/run-evaluator.sh "${RUN_ARGS[@]}"
 # `if [[ $SKIP_PLOTS ... ]]` / `_render_routing_graph` pattern from
 # scripts/run-evaluator.sh. The script itself is idempotent (skips cells
 # whose `jaccard_sweep/summary.csv` already exists), so this loop is safe
-# to re-run; we disable it entirely only when JACCARD_SWEEP_SKIP=1.
+# to re-run; we disable it entirely when SKIP_PYTHON_PLOTS=1 (the
+# default), matching the behaviour for the heatmap + routing-graph steps
+# that we already gated above with --skip-plots --skip-routing-graphs.
 #
 # We discover cells by globbing `${RESULTS_DIR}/<model_safe>/*/` and
 # accepting every subdir that contains at least one
@@ -449,7 +466,7 @@ bash scripts/run-evaluator.sh "${RUN_ARGS[@]}"
 # layout that run-evaluator.sh writes; it also accepts the legacy
 # `<model>/moe-*/` layout (where the model_dir itself is the cell),
 # matching the README's "Migrating old results" advice.
-if [[ "${JACCARD_SWEEP_SKIP:-0}" -ne 1 ]]; then
+if [[ "${SKIP_PYTHON_PLOTS:-1}" -ne 1 ]]; then
     echo "============================================================"
     echo "[$(date -Iseconds)] jaccard K-sweep post-processing"
     echo "============================================================"

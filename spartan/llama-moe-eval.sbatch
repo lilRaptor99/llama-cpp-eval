@@ -67,6 +67,9 @@
 #   DATASETS_OVERRIDE   subset of {mmlu,popqa,bigbench,humaneval,include}
 #                                                   (default: all 5)
 #   QUANTS_OVERRIDE     quants to run                (default: Q4_K_M)
+#   JACCARD_SWEEP_SKIP  skip the per-cell jaccard K-sweep post-step
+#                                                    (default: 0 = run;
+#                                                     1 = skip entirely)
 #   HF_TOKEN            optional, for gated repos    (default: unset)
 
 # ---------------------------------------------------------------- SLURM
@@ -140,6 +143,7 @@ mkdir -p "${BUILD_DIR}" "${DATASETS_DIR}" "${RESULTS_DIR}" "${HF_CACHE}"
 : "${QUANTS_OVERRIDE:=Q4_K_M}"  # default quant
 : "${EXTRA_CMAKE_FLAGS:=}"
 : "${ROUTING_GRAPH_LINE_SCALE:=}" # empty = use routing_graph_from_cpp.py default (5e-7)
+: "${JACCARD_SWEEP_SKIP:=}"     # empty/0 = run per-cell jaccard K-sweep post-step; 1 = skip
 
 # ---------------------------------------------------------------- banner
 echo "============================================================"
@@ -430,6 +434,63 @@ echo "============================================================"
 
 cd "${REPO_ROOT}"
 bash scripts/run-evaluator.sh "${RUN_ARGS[@]}"
+
+# ---------------------------------------------------------------- jaccard sweep
+# Per-cell post-processing: render the Jaccard K-sweep comparing each
+# dataset to the aggregated-across-datasets reference. Mirrors the
+# `if [[ $SKIP_PLOTS ... ]]` / `_render_routing_graph` pattern from
+# scripts/run-evaluator.sh. The script itself is idempotent (skips cells
+# whose `jaccard_sweep/summary.csv` already exists), so this loop is safe
+# to re-run; we disable it entirely only when JACCARD_SWEEP_SKIP=1.
+#
+# We discover cells by globbing `${RESULTS_DIR}/<model_safe>/*/` and
+# accepting every subdir that contains at least one
+# `moe-*/expert_counts.json`. This mirrors the new `<model>/<quant>/`
+# layout that run-evaluator.sh writes; it also accepts the legacy
+# `<model>/moe-*/` layout (where the model_dir itself is the cell),
+# matching the README's "Migrating old results" advice.
+if [[ "${JACCARD_SWEEP_SKIP:-0}" -ne 1 ]]; then
+    echo "============================================================"
+    echo "[$(date -Iseconds)] jaccard K-sweep post-processing"
+    echo "============================================================"
+    n_cells=0; n_fail=0
+    # Glob every <model_safe>/<quant_safe>/ directory under RESULTS_DIR.
+    # `${RESULTS_DIR}/--*` is impossible (model dirs are real names); the
+    # two-level glob avoids descending into moe-*/expert_counts.json's
+    # directory by accident (those have moe-<ds> as their leaf name, not
+    # a quant tag).
+    for cell_dir in "${RESULTS_DIR}"/*/*/; do
+        [[ -d "${cell_dir}" ]] || continue
+        # Require at least one moe-*/expert_counts.json inside.
+        compgen -G "${cell_dir}moe-*/expert_counts.json" >/dev/null \
+            || continue
+        safe="$(basename "$(dirname "${cell_dir}")")"
+        quant="$(basename "${cell_dir}")"
+        # Reverse scripts/run-evaluator.sh::model_safe (replace the FIRST
+        # '--' with '/') to recover the HF repo id. If the cell is the
+        # legacy no-quant layout (cell_dir == model_dir), we still record
+        # the quant as "<no-quant>" for the README.json.
+        if [[ "${safe}" == *"--"* ]]; then
+            model_id="${safe/--//}"
+        else
+            model_id="${safe}"
+        fi
+        log="${cell_dir%/}/jaccard_sweep.log"
+        n_cells=$(( n_cells + 1 ))
+        echo "[info] cell=${cell_dir}  model=${model_id}  quant=${quant}"
+        if ! python3 "${REPO_ROOT}/examples/eval-moe-overview/jaccard_sweep_from_cpp.py" \
+                --cell-dir "${cell_dir%/}" \
+                --model-id "${model_id}" \
+                --quant "${quant}" \
+                >"${log}" 2>&1; then
+            echo "[warn] jaccard sweep failed for ${cell_dir}; log: ${log}"
+            n_fail=$(( n_fail + 1 ))
+        else
+            echo "[ok]   jaccard sweep -> ${cell_dir%/}/jaccard_sweep/"
+        fi
+    done
+    echo "[info] jaccard sweep: ${n_cells} cell(s) processed, ${n_fail} failure(s)"
+fi
 
 echo "============================================================"
 echo "[$(date -Iseconds)] llama-moe-eval finished (rc=$?)"

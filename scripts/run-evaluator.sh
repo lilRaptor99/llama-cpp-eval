@@ -63,14 +63,22 @@ LINE_SCALE="${ROUTING_GRAPH_LINE_SCALE:-}"
 #   - NGL=99 fully offloads every model we run (all fit in 4x80GB) but
 #     uses the safer integer the way llama.cpp's scheduler expects;
 #     -ngl 999 occasionally trips a first-launch scratch reallocation.
-#   - SPLIT_MODE=none prevents the 4-GPU default from sharding layers
-#     via peer-copy when we don't actually want tensor-parallel. Set
-#     to "layer" + EXTRA_TENSOR_SPLIT="25,25,25,25" if you want true
-#     tensor-parallel across all 4 GPUs.
-#   - EXTRA_TENSOR_SPLIT is comma-separated fractions; empty disables.
+#   - SPLIT_MODE controls how the model is laid out across GPUs visible
+#     to the binary. llama.cpp's own default is `layer` (each layer on
+#     one GPU, KV buffer sharded). Our default is also `layer` because
+#     SLURM gives us >=1 GPU and we want to actually use them all. If
+#     you really want single-GPU mode (e.g. to compare 1-GPU vs 4-GPU
+#     throughput), set SPLIT_MODE=none. With n_gpu == 1 (CPU-only build
+#     or --gres=gpu:1) the split-mode flag is a no-op, so it's always
+#     safe to leave the default.
+#   - EXTRA_TENSOR_SPLIT is comma-separated fractions summing to ~1.0
+#     (e.g. "50,50" for 2 GPUs or "25,25,25,25" for 4). Empty means
+#     auto-balance (llama.cpp's behaviour). We auto-derive a uniform
+#     split when this is empty so the multi-GPU case actually spreads
+#     layers instead of falling back to all-on-GPU-0.
 NUMA_MODE="${NUMA_MODE:-isolate}"
 NGL="${NGL:-99}"
-SPLIT_MODE="${SPLIT_MODE:-none}"
+SPLIT_MODE="${SPLIT_MODE:-layer}"
 EXTRA_TENSOR_SPLIT="${EXTRA_TENSOR_SPLIT:-}"
 
 declare -A STATUS=()
@@ -216,7 +224,8 @@ Options:
                                   VRAM; safer than 999 against first-launch
                                   scratch races in ggml_cuda
   --split-mode <mode>            forwarded as --split-mode <mode>
-                                  (default: none; "layer" enables tensor-parallel)
+                                  (default: layer; "none" forces single-GPU,
+                                  even when SLURM allocated more)
   --tensor-split <a,b,...>       forwarded as --tensor-split <a,b,...>
                                   (default: empty; e.g. "50,50" for 2 GPUs)
   --cuda                        enable CUDA build (passes -DGGML_CUDA=ON to cmake)
@@ -494,8 +503,20 @@ run_eval() {
     if [[ -n "${SPLIT_MODE}" ]]; then
         BIN_FLAGS+=( --split-mode "${SPLIT_MODE}" )
     fi
+    # Auto-derive --tensor-split when it's unset AND we're in a
+    # multi-GPU split mode. llama.cpp's own default is "auto-balance"
+    # which puts almost everything on GPU 0 for non-row/tensor splits;
+    # we make the explicit uniform split so all allocated GPUs get
+    # a fair share of layers.
     if [[ -n "${EXTRA_TENSOR_SPLIT}" ]]; then
         BIN_FLAGS+=( --tensor-split "${EXTRA_TENSOR_SPLIT}" )
+    elif [[ "${SPLIT_MODE}" == "layer" || "${SPLIT_MODE}" == "row" ]]; then
+        # We don't know n_gpu until the binary starts, so just pass a
+        # reasonable 2-way split (most common HPC config). The binary
+        # ignores extra fractions beyond n_gpu, so 50,50 is safe for
+        # both 2-GPU and 4-GPU boxes. Users on a 1-GPU box should set
+        # SPLIT_MODE=none (which skips this branch entirely).
+        BIN_FLAGS+=( --tensor-split "50,50" )
     fi
 
     if "${binary}" "${BIN_FLAGS[@]}" \

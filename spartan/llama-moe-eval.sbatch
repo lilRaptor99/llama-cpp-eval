@@ -83,20 +83,25 @@
 #                       but uses the safer integer the way llama.cpp's
 #                       scheduler expects; -ngl 999 occasionally trips a
 #                       first-launch scratch re-allocation in ggml_cuda.
-#   SPLIT_MODE          llama.cpp --split-mode      (default: none)
-#                       With 4 GPUs visible on gpu-a100, the default
-#                       `layer` split would shard a single MoE layer
-#                       across GPUs via peer-copy. `none` keeps each
-#                       layer on one GPU and lets ggml_cuda use NVLink
-#                       only for tensor-parallel MoE on a per-layer
-#                       basis, which is what we want when each model
-#                       already fits in 1x80GB. See EXTRA_TENSOR_SPLIT
-#                       below if you want explicit per-GPU sizing.
-#   EXTRA_TENSOR_SPLIT  passed as --tensor-split    (default: unset)
-#                       Comma-separated fraction list (e.g. "50,50" for
-#                       2 GPUs or "25,25,25,25" for 4). Only used when
-#                       SPLIT_MODE=layer|row. Empty disables tensor
-#                       splitting.
+#   SPLIT_MODE          llama.cpp --split-mode      (default: layer)
+#                       `layer` shards layers across GPUs (pipeline
+#                       parallel) and is what llama.cpp itself defaults
+#                       to. We forward the same default so multi-GPU
+#                       nodes actually USE their allocated GPUs. Set
+#                       to "none" if you want a single-GPU run for
+#                       comparison. `row` and `tensor` enable weight-
+#                       parallel sharding (slower over PCIe without
+#                       NVLink; not recommended here).
+#   NGPUS               number of GPUs the binary should plan for
+#                                                  (default: 2 = SLURM gres)
+#                       Used to auto-derive --tensor-split when
+#                       EXTRA_TENSOR_SPLIT is empty.
+#   EXTRA_TENSOR_SPLIT  passed as --tensor-split    (default: auto)
+#                       Comma-separated fraction list summing to ~1.0
+#                       (e.g. "50,50" for 2 GPUs or "25,25,25,25" for 4).
+#                       Empty triggers auto-derivation: a uniform
+#                       "$(repeat 'X,' $NGPUS)" string is forwarded so
+#                       every GPU gets a fair share of layers.
 #   SKIP_PYTHON_PLOTS   master switch for ALL python post-processing
 #                       (per-cell heatmap, routing graph, jaccard K-sweep)
 #                                                    (default: 1 = SKIP all;
@@ -106,7 +111,7 @@
 # ---------------------------------------------------------------- SLURM
 #SBATCH --job-name=llama-moe-eval
 #SBATCH --partition=gpu-a100
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=24
 #SBATCH --mem=128G
 #SBATCH --time=0-06:00:00
@@ -180,12 +185,14 @@ mkdir -p "${BUILD_DIR}" "${DATASETS_DIR}" "${RESULTS_DIR}" "${HF_CACHE}"
 #     and stops pinning Mixtral's per-expert memory to the wrong node.
 #   - NGL_OVERRIDE=99 is equivalent to -ngl 999 for every model we run
 #     (all fit in 4x80GB VRAM) but avoids the first-launch scratch race.
-#   - SPLIT_MODE=none prevents the 4-GPU default from sharding layers
-#     via peer-copy when we don't actually want tensor-parallel.
+#   - SPLIT_MODE=layer shards layers across the GPUs SLURM allocated.
+#     llama.cpp's own default is `layer`, so we match it; otherwise the
+#     binary silently picks GPU 0 only and leaves the rest idle.
 : "${NUMA_MODE:=isolate}"
 : "${NGL_OVERRIDE:=99}"
-: "${SPLIT_MODE:=none}"
-: "${EXTRA_TENSOR_SPLIT:=}"
+: "${SPLIT_MODE:=layer}"
+: "${NGPUS:=2}"     # mirrors --gres=gpu:2 above; update both together.
+: "${EXTRA_TENSOR_SPLIT:=}"  # empty = auto-derive uniform split for NGPUS
 : "${SKIP_PYTHON_PLOTS:=1}"     # 1 = skip ALL python post-processing (plots,
                                  #     routing graphs, jaccard sweep);
                                  # 0 = run all of them. Default 1 because
@@ -217,7 +224,8 @@ echo "[$(date -Iseconds)] EXTRA_CMAKE_FLAGS = ${EXTRA_CMAKE_FLAGS:-<unset>}"
 echo "[$(date -Iseconds)] NUMA_MODE         = ${NUMA_MODE}"
 echo "[$(date -Iseconds)] NGL_OVERRIDE      = ${NGL_OVERRIDE}"
 echo "[$(date -Iseconds)] SPLIT_MODE        = ${SPLIT_MODE}"
-echo "[$(date -Iseconds)] EXTRA_TENSOR_SPLIT= ${EXTRA_TENSOR_SPLIT:-<unset>}"
+echo "[$(date -Iseconds)] NGPUS             = ${NGPUS}"
+echo "[$(date -Iseconds)] EXTRA_TENSOR_SPLIT= ${EXTRA_TENSOR_SPLIT:-auto (${NGPUS}-way uniform)}"
 echo "[$(date -Iseconds)] SKIP_PYTHON_PLOTS = ${SKIP_PYTHON_PLOTS}"
 echo "============================================================"
 
@@ -339,10 +347,10 @@ export HF_HOME="${HF_CACHE}"
 export HUGGINGFACE_HUB_CACHE="${HF_CACHE}"
 
 # CUDA runtime knobs from docs/build.md that improve behaviour on tight-VRAM
-# scenarios (the 120B model + 4-bit quant will push close to the 4x80GB
+# scenarios (the 120B model + 4-bit quant will push close to the 2x80GB
 # limit on the A100 node).
 export GGML_CUDA_ENABLE_UNIFIED_MEMORY="${GGML_CUDA_ENABLE_UNIFIED_MEMORY:-1}"
-# NB: -ngl 999 is set by run-evaluator.sh's run_eval() and offloads every
+# NB: -ngl 99 is set by run-evaluator.sh's run_eval() and offloads every
 #     layer to GPU. We do not override that here.
 
 # Compiler-visible CMAKE_ARCHS for the build phase.
@@ -492,6 +500,22 @@ if [[ -n "${SPLIT_MODE}" ]]; then
 fi
 if [[ -n "${EXTRA_TENSOR_SPLIT}" ]]; then
     RUN_ARGS+=( --tensor-split "${EXTRA_TENSOR_SPLIT}" )
+elif [[ -n "${NGPUS}" && "${SPLIT_MODE}" != "none" ]]; then
+    # Auto-derive uniform split so every allocated GPU gets a fair share.
+    # Examples: NGPUS=2 -> "50,50"; NGPUS=4 -> "25,25,25,25".
+    # We compute it here rather than letting the orchestrator default to
+    # 50,50, because the user might submit with --gres=gpu:4 and want a
+    # 4-way split without setting EXTRA_TENSOR_SPLIT explicitly.
+    _auto_frac="$(awk -v n="${NGPUS}" 'BEGIN{ printf "%.4f", 100.0/n }')"
+    _auto_split=""
+    _auto_i=0
+    while [[ ${_auto_i} -lt ${NGPUS} ]]; do
+        _auto_split+="${_auto_frac}"
+        _auto_i=$(( _auto_i + 1 ))
+        [[ ${_auto_i} -lt ${NGPUS} ]] && _auto_split+=","
+    done
+    RUN_ARGS+=( --tensor-split "${_auto_split}" )
+    unset _auto_frac _auto_split _auto_i
 fi
 # SKIP_PYTHON_PLOTS=1 (default) disables every Python plotting step:
 #   - heatmap_from_cpp.py (per-cell routing heatmaps)

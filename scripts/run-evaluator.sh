@@ -53,6 +53,25 @@ PRINT_USAGE=0
 # pair counts: OLMoE (~1e7 pair counts) wants ~1e-4, Mixtral (~1e6) wants
 # ~1e-5. Empty means use the wrapper default (5e-7).
 LINE_SCALE="${ROUTING_GRAPH_LINE_SCALE:-}"
+# Forwarded to the C++ binary as --numa / -ngl / --split-mode /
+# --tensor-split. Defaults below were tuned for single-A100 + 4xA100
+# PCIe partitions (gpu-a100 on Spartan):
+#   - NUMA_MODE=isolate avoids the "illegal memory access" race in
+#     ggml_cuda's first launch (observed on OLMoE/include) and stops
+#     pinning per-expert allocations to the wrong NUMA node on
+#     multi-GPU PCIe boxes (observed slowing Mixtral by ~30%).
+#   - NGL=99 fully offloads every model we run (all fit in 4x80GB) but
+#     uses the safer integer the way llama.cpp's scheduler expects;
+#     -ngl 999 occasionally trips a first-launch scratch reallocation.
+#   - SPLIT_MODE=none prevents the 4-GPU default from sharding layers
+#     via peer-copy when we don't actually want tensor-parallel. Set
+#     to "layer" + EXTRA_TENSOR_SPLIT="25,25,25,25" if you want true
+#     tensor-parallel across all 4 GPUs.
+#   - EXTRA_TENSOR_SPLIT is comma-separated fractions; empty disables.
+NUMA_MODE="${NUMA_MODE:-isolate}"
+NGL="${NGL:-99}"
+SPLIT_MODE="${SPLIT_MODE:-none}"
+EXTRA_TENSOR_SPLIT="${EXTRA_TENSOR_SPLIT:-}"
 
 declare -A STATUS=()
 
@@ -189,6 +208,17 @@ Options:
   --skip-routing-graphs         skip routing_graph_from_cpp.py invocation
   --line-scale <float>          routing graph --line-scale override
                                 (default: 5e-7; tune to your pair count magnitude)
+  --numa <mode>                  forwarded as --numa <mode> to the C++ binary
+                                  (default: isolate; try "distribute" or empty
+                                  if you have NUMA-aware workload issues)
+  --ngl <int>                    forwarded as -ngl <int> (default: 99)
+                                  99 fully offloads every model that fits in
+                                  VRAM; safer than 999 against first-launch
+                                  scratch races in ggml_cuda
+  --split-mode <mode>            forwarded as --split-mode <mode>
+                                  (default: none; "layer" enables tensor-parallel)
+  --tensor-split <a,b,...>       forwarded as --tensor-split <a,b,...>
+                                  (default: empty; e.g. "50,50" for 2 GPUs)
   --cuda                        enable CUDA build (passes -DGGML_CUDA=ON to cmake)
   --no-cuda                     disable CUDA build (default)
   -h, --help                    show this message and exit
@@ -198,6 +228,10 @@ Environment:
   CUDA_ARCHITECTURES="80;89"     forwarded as -DCMAKE_CUDA_ARCHITECTURES=<...>
                                  (only used when --cuda is set)
   ROUTING_GRAPH_LINE_SCALE=<f>   equivalent to --line-scale <f>
+  NUMA_MODE=<mode>               equivalent to --numa <mode>
+  NGL=<int>                      equivalent to --ngl <int>
+  SPLIT_MODE=<mode>              equivalent to --split-mode <mode>
+  EXTRA_TENSOR_SPLIT=<a,b,...>   equivalent to --tensor-split <a,b,...>
 
 The hardcoded MODELS list is at the top of the script (DEFAULT_MODELS).
 The default quantization is Q4_K_M (see QUANTS= at the top of the script).
@@ -245,6 +279,10 @@ parse_args() {
             --skip-plots)       SKIP_PLOTS=1; shift ;;
             --skip-routing-graphs)  SKIP_ROUTING_GRAPHS=1; shift ;;
             --line-scale)       LINE_SCALE="$2"; shift 2 ;;
+            --numa)             NUMA_MODE="$2"; shift 2 ;;
+            --ngl)              NGL="$2"; shift 2 ;;
+            --split-mode)       SPLIT_MODE="$2"; shift 2 ;;
+            --tensor-split)     EXTRA_TENSOR_SPLIT="$2"; shift 2 ;;
             --cuda)             USE_CUDA=1; shift ;;
             --no-cuda)          USE_CUDA=0; shift ;;
             -h|--help)          PRINT_USAGE=1; shift ;;
@@ -442,7 +480,25 @@ run_eval() {
     local -a DS_FLAGS
     IFS=' ' read -r -a DS_FLAGS <<< "$(dataset_input_flags_for "$ds")"
 
-    if "${binary}" -hf "${model}:${quant}" -ngl 999 --numa distribute \
+    # Compose C++ binary argv. --numa / -ngl / --split-mode /
+    # --tensor-split are configurable from the env (NUMA_MODE / NGL /
+    # SPLIT_MODE / EXTRA_TENSOR_SPLIT) so the spartan sbatch can tune
+    # them per partition. We always forward them (even with defaults)
+    # because llama.cpp's argument parser requires explicit values for
+    # --split-mode / --tensor-split to take effect; the defaults below
+    # are equivalent to "no-op" so it's safe to pass them unconditionally.
+    local -a BIN_FLAGS=( -hf "${model}:${quant}" "-ngl" "${NGL}" )
+    if [[ -n "${NUMA_MODE}" ]]; then
+        BIN_FLAGS+=( --numa "${NUMA_MODE}" )
+    fi
+    if [[ -n "${SPLIT_MODE}" ]]; then
+        BIN_FLAGS+=( --split-mode "${SPLIT_MODE}" )
+    fi
+    if [[ -n "${EXTRA_TENSOR_SPLIT}" ]]; then
+        BIN_FLAGS+=( --tensor-split "${EXTRA_TENSOR_SPLIT}" )
+    fi
+
+    if "${binary}" "${BIN_FLAGS[@]}" \
             "${CF_FLAGS[@]}" "${DS_FLAGS[@]}" \
             -o "$json" \
             >"$log" 2>&1; then
@@ -546,7 +602,7 @@ main() {
     _log_info "MODELS (${#MODELS[@]})       = ${MODELS[*]}"
     _log_info "DATASETS (${#DATASETS[@]})     = ${DATASETS[*]}"
     _log_info "QUANTS (${#QUANTS[@]})       = ${QUANTS[*]}"
-    _log_info "REBUILD=${REBUILD}, REDOWNLOAD=${REDOWNLOAD}, SKIP_PLOTS=${SKIP_PLOTS}, SKIP_ROUTING_GRAPHS=${SKIP_ROUTING_GRAPHS}, USE_CUDA=${USE_CUDA}, ROUTING_GRAPH_LINE_SCALE=${LINE_SCALE:-<default 5e-7>}"
+    _log_info "REBUILD=${REBUILD}, REDOWNLOAD=${REDOWNLOAD}, SKIP_PLOTS=${SKIP_PLOTS}, SKIP_ROUTING_GRAPHS=${SKIP_ROUTING_GRAPHS}, USE_CUDA=${USE_CUDA}, ROUTING_GRAPH_LINE_SCALE=${LINE_SCALE:-<default 5e-7>}, NUMA_MODE=${NUMA_MODE}, NGL=${NGL}, SPLIT_MODE=${SPLIT_MODE}, EXTRA_TENSOR_SPLIT=${EXTRA_TENSOR_SPLIT:-<unset>}"
     echo "============================================================"
 
     echo "============================================================"

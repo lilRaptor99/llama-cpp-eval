@@ -67,6 +67,36 @@
 #   DATASETS_OVERRIDE   subset of {mmlu,popqa,bigbench,humaneval,include}
 #                                                   (default: all 5)
 #   QUANTS_OVERRIDE     quants to run                (default: Q4_K_M)
+#   NUMA_MODE           llama.cpp --numa flag        (default: isolate)
+#                       - distribute: original; caused ggml_cuda
+#                         "illegal memory access" on OLMoE first-launch
+#                         and slowed Mixtral by pinning memory to the
+#                         wrong NUMA node on multi-GPU PCIe A100.
+#                       - isolate:    first-touch placement, no inter-node
+#                         hops; safe on both 1-GPU and 4-GPU boxes.
+#                       - numactl:    pass-through to `numactl` (manual).
+#                       - (empty):    omit --numa entirely (let llama.cpp
+#                         pick; matches common.cpp default).
+#   NGL_OVERRIDE        override llama.cpp -ngl     (default: 99)
+#                       -ngl 99 fully offloads every model that fits in
+#                       VRAM (which on 4x80GB A100 is everything we run),
+#                       but uses the safer integer the way llama.cpp's
+#                       scheduler expects; -ngl 999 occasionally trips a
+#                       first-launch scratch re-allocation in ggml_cuda.
+#   SPLIT_MODE          llama.cpp --split-mode      (default: none)
+#                       With 4 GPUs visible on gpu-a100, the default
+#                       `layer` split would shard a single MoE layer
+#                       across GPUs via peer-copy. `none` keeps each
+#                       layer on one GPU and lets ggml_cuda use NVLink
+#                       only for tensor-parallel MoE on a per-layer
+#                       basis, which is what we want when each model
+#                       already fits in 1x80GB. See EXTRA_TENSOR_SPLIT
+#                       below if you want explicit per-GPU sizing.
+#   EXTRA_TENSOR_SPLIT  passed as --tensor-split    (default: unset)
+#                       Comma-separated fraction list (e.g. "50,50" for
+#                       2 GPUs or "25,25,25,25" for 4). Only used when
+#                       SPLIT_MODE=layer|row. Empty disables tensor
+#                       splitting.
 #   SKIP_PYTHON_PLOTS   master switch for ALL python post-processing
 #                       (per-cell heatmap, routing graph, jaccard K-sweep)
 #                                                    (default: 1 = SKIP all;
@@ -144,6 +174,18 @@ mkdir -p "${BUILD_DIR}" "${DATASETS_DIR}" "${RESULTS_DIR}" "${HF_CACHE}"
 : "${QUANTS_OVERRIDE:=Q4_K_M}"  # default quant
 : "${EXTRA_CMAKE_FLAGS:=}"
 : "${ROUTING_GRAPH_LINE_SCALE:=}" # empty = use routing_graph_from_cpp.py default (5e-7)
+# NUMA + GPU-offload knobs. See the env-var table at the top of this
+# file for rationale; the short version is:
+#   - NUMA_MODE=isolate fixes the OLMoE/include "illegal memory access"
+#     and stops pinning Mixtral's per-expert memory to the wrong node.
+#   - NGL_OVERRIDE=99 is equivalent to -ngl 999 for every model we run
+#     (all fit in 4x80GB VRAM) but avoids the first-launch scratch race.
+#   - SPLIT_MODE=none prevents the 4-GPU default from sharding layers
+#     via peer-copy when we don't actually want tensor-parallel.
+: "${NUMA_MODE:=isolate}"
+: "${NGL_OVERRIDE:=99}"
+: "${SPLIT_MODE:=none}"
+: "${EXTRA_TENSOR_SPLIT:=}"
 : "${SKIP_PYTHON_PLOTS:=1}"     # 1 = skip ALL python post-processing (plots,
                                  #     routing graphs, jaccard sweep);
                                  # 0 = run all of them. Default 1 because
@@ -172,6 +214,11 @@ echo "[$(date -Iseconds)] GCC_MODULE    = ${GCC_MODULE}"
 echo "[$(date -Iseconds)] CMAKE_MODULE  = ${CMAKE_MODULE}"
 echo "[$(date -Iseconds)] CUDA_ARCHS    = ${CUDA_ARCHITECTURES}"
 echo "[$(date -Iseconds)] EXTRA_CMAKE_FLAGS = ${EXTRA_CMAKE_FLAGS:-<unset>}"
+echo "[$(date -Iseconds)] NUMA_MODE         = ${NUMA_MODE}"
+echo "[$(date -Iseconds)] NGL_OVERRIDE      = ${NGL_OVERRIDE}"
+echo "[$(date -Iseconds)] SPLIT_MODE        = ${SPLIT_MODE}"
+echo "[$(date -Iseconds)] EXTRA_TENSOR_SPLIT= ${EXTRA_TENSOR_SPLIT:-<unset>}"
+echo "[$(date -Iseconds)] SKIP_PYTHON_PLOTS = ${SKIP_PYTHON_PLOTS}"
 echo "============================================================"
 
 # ---------------------------------------------------------------- modules
@@ -433,6 +480,18 @@ if [[ -n "${QUANTS_OVERRIDE}" ]]; then
 fi
 if [[ -n "${ROUTING_GRAPH_LINE_SCALE}" ]]; then
     RUN_ARGS+=( --line-scale "${ROUTING_GRAPH_LINE_SCALE}" )
+fi
+if [[ -n "${NUMA_MODE}" ]]; then
+    RUN_ARGS+=( --numa "${NUMA_MODE}" )
+fi
+if [[ -n "${NGL_OVERRIDE}" ]]; then
+    RUN_ARGS+=( --ngl "${NGL_OVERRIDE}" )
+fi
+if [[ -n "${SPLIT_MODE}" ]]; then
+    RUN_ARGS+=( --split-mode "${SPLIT_MODE}" )
+fi
+if [[ -n "${EXTRA_TENSOR_SPLIT}" ]]; then
+    RUN_ARGS+=( --tensor-split "${EXTRA_TENSOR_SPLIT}" )
 fi
 # SKIP_PYTHON_PLOTS=1 (default) disables every Python plotting step:
 #   - heatmap_from_cpp.py (per-cell routing heatmaps)

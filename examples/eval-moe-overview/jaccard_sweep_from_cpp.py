@@ -1,50 +1,81 @@
 #!/usr/bin/env python3
 # type: ignore
 
-"""Per-cell Jaccard K-sweep plotter for the MoE-routing eval suite.
+"""Per-cell cross-dataset top-K alignment plotter for the MoE-routing eval suite.
 
 For one `(model, quant)` cell at `${RESULTS_DIR}/<model_safe>/<quant_safe>/`,
-renders a Jaccard-similarity K-sweep comparing every dataset's top-K experts
-to the **aggregated-across-datasets reference** top-K. This is the first
-phase of a MoE-routing consistency study; a second phase (cross-quant
-comparison + cosine / JS) will be added later.
+renders two views of cross-dataset alignment on the **top-K expert sets**:
+
+  1. A pairwise heatmap (dataset × dataset) at K = n_expert_used,
+     averaged across layers — the visual.
+  2. A single-number-per-K view: x = K, y = cross-dataset Jaccard.
+     Two complementary metrics overlaid (generalized |∩|/|∪| + mean pairwise).
 
 Outputs (under `<cell-dir>/jaccard_sweep/`):
 
-  - jaccard_sweep.csv        long-form: dataset, layer, K, jaccard, jaccard_n_used
-  - jaccard_sweep.png        1 subplot per layer; x = K, y = Jaccard; 1 line per dataset
-  - jaccard_vs_n_used.png    bar chart per dataset at K = n_expert_used
-                             (mean across layers + min across layers)
-  - summary.csv              per dataset: jaccard_at_n_used, jaccard_auc,
-                             jaccard_at_n_used_per_layer_min, n_layers_below_0.5
-  - README.json              meta: model, quant, K values, arch, token totals
+  - jaccard_pairwise.csv     long-form: K, layer, dataset_a, dataset_b, jaccard
+                             (every pair of datasets; one row per (K, layer))
+  - jaccard_pairwise.png         heatmap of pairwise Jaccard at K = K_model,
+                                 averaged across layers; primary heatmap
+  - jaccard_pairwise_K{K}.png    additional heatmap at K = 2 * K_model
+                                 and K = 3 * K_model (one file per K, with
+                                 K embedded in the filename), same
+                                 averaging/colormap as the primary
+  - jaccard_pairwise_K2x.png     convenience alias for the 2*K_model heatmap
+                                 (always present when E >= 2*K_model)
+  - jaccard_pairwise_K3x.png     convenience alias for the 3*K_model heatmap
+                                 (always present when E >= 3*K_model)
+  - jaccard_global.csv       long-form: K, layer, jaccard_union, jaccard_pairwise_mean
+                             (single-number-per-(K, layer) view of cross-dataset alignment)
+  - jaccard_global.png       x = K, y = cross-dataset Jaccard; thin per-layer lines
+                             + bold mean across layers; both union and pairwise-mean
+                             metrics overlaid for comparison
+  - summary.csv              per dataset: tokens, n_rows,
+                             mean_jaccard_to_others_at_n_used,
+                             min_jaccard_to_others_at_n_used
+  - README.json              meta: model, quant, K values, arch, token totals,
+                             cross-dataset alignment summary at K=K_model
 
-Mathematical contract (matches §5 of the task spec):
+Mathematical contract:
 
-  p_ds[l]   = counts_ds[l]   / tokens_ds                          (per-dataset)
-  p_ref[l]  = counts_agg[l]  / tokens_agg                         (aggregated)
-  A_K       = top-K(p_ds[l])  by descending value, ties -> asc expert id
-  B_K       = top-K(p_ref[l]) by descending value, ties -> asc expert id
-  Jaccard_K = |A_K ∩ B_K| / |A_K ∪ B_K|
-  jaccard=1.0 when both sets empty; jaccard=0.0 when exactly one is empty
+  For each layer l and K value:
+    A_i_K[l]  = top-K experts in dataset i, layer l
+                (descending count, ties -> ascending expert id)
+    |∩|_K[l]  = |∩_i A_i_K[l]|              (intersection across datasets)
+    |∪|_K[l]  = |∪_i A_i_K[l]|              (union across datasets)
+    generalized Jaccard (strict consensus): |∩|_K[l] / |∪|_K[l]
+    mean pairwise Jaccard:                  mean over all C(N, 2) pairs of
+                                            |A_i ∩ A_j| / |A_i ∪ A_j|
 
-The aggregated reference distribution is always taken as the live sum of
-the per-dataset `layer_expert_counts` matrices. If
-`<cell-dir>/overall/top_experts.json` exists, we sanity-check it against
-the live sum and warn (but do not fail) on disagreement — this is the
-"preferred path" the spec calls out, but the live sum is the
-authoritative source so the script also works before
-`aggregate_overview.py` has been run.
+  Edge cases follow the same convention as `_jaccard`:
+    1.0 when all sets empty, 0.0 when only one is non-empty.
 
-Per-dataset scalar summaries (summary.csv):
+The aggregated cross-dataset reference is *not* used here — these views
+compare datasets directly to one another. For "dataset vs aggregated
+reference" views, see the older `jaccard_sweep` output of
+`aggregate_overview.py`.
 
-  - jaccard_at_n_used                  mean across layers at K = n_expert_used
-  - jaccard_auc                        mean across layers of the trapezoidal
-                                       AUC over the K-sweep, normalised by
-                                       (max(K) - min(K))
-  - jaccard_at_n_used_per_layer_min    min across layers at K = n_expert_used
-  - n_layers_below_0.5                 number of layers with
-                                       jaccard_at_n_used < 0.5
+Two CLI modes:
+
+  - Single cell:
+        python3 jaccard_sweep_from_cpp.py --cell-dir <path> \
+            [--model-id <hf-repo-id>] [--quant <tag>]
+
+  - Multi-cell batch (used by spartan/llama-moe-eval.sbatch):
+        python3 jaccard_sweep_from_cpp.py --results-dir <root> \
+            --models <safe1> [<safe2> ...] [--quants <q1> [<q2> ...]]
+
+The script is idempotent: a cell whose `jaccard_sweep/summary.csv` already
+exists is skipped (use --force to re-render). Errors are reported as
+one-line `SystemExit("[error] ...")` messages so the .sbatch can surface
+them via the per-cell log.
+
+Dependencies: numpy + matplotlib only. We `from aggregate_overview import`
+the three helpers we need (_load_one, compute_top_k, _RECORD_KEYS) —
+`aggregate_overview.py` is the sibling peer script in this directory,
+not a shared library, so this stays consistent with the README's
+"no shared library import" convention while still avoiding the
+copy-paste the spec explicitly forbids.
 
 Two CLI modes:
 
@@ -116,17 +147,25 @@ def _top_k_set_for_layer(counts: np.ndarray, layer: int, K: int) -> set[int]:
 def _make_k_values(n_expert: int, n_expert_used: int,
                    k_min: int, k_max_frac: float, num_ks: int) -> list[int]:
     """Build the K-sweep grid: linear `num_ks` samples in [k_min, k_max],
-    always including K = n_expert_used and K = ceil(0.125 * E).
+    always including K = n_expert_used, ceil(0.125 * E), 2*n_expert_used
+    and 3*n_expert_used (clamped to E).
     """
     k_min = max(1, int(k_min))
     k_max = max(k_min, int(np.ceil(n_expert * k_max_frac)))
     # Dense linspace, dedup + sort + cast to int.
     base = np.linspace(k_min, k_max, num=max(1, int(num_ks)))
     base_ints = sorted({int(round(float(v))) for v in base})
-    # Must-include sentinel K values; spec §5 lists both n_expert_used and
-    # ceil(0.125 * E). We add them after the linspace so they're present
-    # even when num_ks is small.
-    must_include = {int(n_expert_used), int(np.ceil(n_expert * 0.125))}
+    # Must-include sentinel K values: n_expert_used, ceil(0.125 * E), and
+    # the 2x / 3x K_model values that drive the extra heatmaps. We add
+    # them after the linspace so they're present even when num_ks is
+    # small. The 2x/3x Ks are clamped to E so we don't ask for more top-K
+    # experts than the model has.
+    must_include = {
+        int(n_expert_used),
+        int(np.ceil(n_expert * 0.125)),
+        int(min(2 * n_expert_used, n_expert)),
+        int(min(3 * n_expert_used, n_expert)),
+    }
     base_ints = sorted(set(base_ints) | must_include)
     # Final clamp + dedup.
     base_ints = [k for k in base_ints if 1 <= k <= n_expert]
@@ -146,6 +185,34 @@ def _jaccard(a: set[int], b: set[int]) -> float:
     if not union:
         return 0.0
     inter = a & b
+    return len(inter) / len(union)
+
+
+def _generalized_jaccard(sets_list: list[set[int]]) -> float:
+    """Generalized Jaccard for N>=1 sets:  |∩ A_i| / |∪ A_i|.
+
+    "Strict consensus" measure — 1.0 iff every dataset has the *exact
+    same* top-K set, drops fast if any dataset diverges. Returns:
+
+      - 1.0 when all sets are empty (no data -> trivially agree)
+      - 0.0 when only one set is non-empty (no comparison possible)
+      - `len(intersection) / len(union)` in the general case
+
+    Mirrors the empty-set conventions of `_jaccard` so the two metrics
+    stay numerically comparable.
+    """
+    non_empty = [s for s in sets_list if s]
+    if not non_empty:
+        return 1.0
+    if len(non_empty) == 1:
+        return 0.0
+    inter = non_empty[0].copy()
+    union = non_empty[0].copy()
+    for s in non_empty[1:]:
+        inter &= s
+        union |= s
+    if not union:
+        return 1.0
     return len(inter) / len(union)
 
 
@@ -204,7 +271,12 @@ def _load_cell(cell_dir: Path) -> tuple[
 
 
 def _aggregate(per_ds_counts: dict[str, np.ndarray]) -> np.ndarray:
-    """Sum per-dataset [L, E] count matrices into a single [L, E] array."""
+    """Sum per-dataset [L, E] count matrices into a single [L, E] array.
+
+    Retained for potential future use but not referenced by the
+    cross-dataset outputs anymore (the two remaining plots compare
+    datasets directly, not against the aggregated reference).
+    """
     first = next(iter(per_ds_counts.values()))
     out = np.zeros_like(first, dtype=np.int64)
     for counts in per_ds_counts.values():
@@ -216,8 +288,9 @@ def _sanity_check_top_experts(cell_dir: Path, counts_agg: np.ndarray,
                               tokens_agg: int) -> None:
     """Compare live aggregate against `overall/top_experts.json` if present.
 
-    The live sum is authoritative (spec §3 fallback path); this is a
-    diagnostic only. We warn on disagreement but never fail.
+    Diagnostic only — the cross-dataset outputs do not use the aggregated
+    reference, so we no longer call this from `process_cell`. Kept for
+    future extensions and as a regression test for `aggregate_overview.py`.
     """
     te_path = cell_dir / "overall" / "top_experts.json"
     if not te_path.exists():
@@ -276,23 +349,14 @@ def process_cell(cell_dir: Path, *, output_dir: Path | None = None,
     E = arch["n_expert"]
     K_model = arch["n_expert_used"]
 
-    counts_agg = _aggregate(per_ds_counts)
     tokens_agg = int(sum(per_ds_tokens.values()))
-    print(f"[agg] aggregated counts_total shape={counts_agg.shape}, "
-          f"tokens_total={tokens_agg:,}")
-
-    _sanity_check_top_experts(cell_dir, counts_agg, tokens_agg)
 
     K_values = _make_k_values(E, K_model, k_min, k_max_frac, num_ks)
     print(f"[plan] arch={arch['name']} L={L} E={E} K_model={K_model}; "
-          f"K-sweep ({len(K_values)} values) = {K_values}")
+          f"K-sweep ({len(K_values)} values) = {K_values}; "
+          f"datasets={len(per_ds_counts)}; tokens_aggregated={tokens_agg:,}")
 
-    # Pre-compute the reference (aggregated) top-K sets, one set per (K, layer).
-    ref_topk: dict[int, list[set[int]]] = {
-        K: [_top_k_set_for_layer(counts_agg, layer, K) for layer in range(L)]
-        for K in K_values
-    }
-    # And the per-dataset top-K sets, structured as
+    # Per-dataset top-K sets, structured as
     #   ds_topk[ds][K][layer] -> set[int]
     ds_topk: dict[str, dict[int, list[set[int]]]] = {}
     for ds, counts in per_ds_counts.items():
@@ -301,84 +365,111 @@ def process_cell(cell_dir: Path, *, output_dir: Path | None = None,
             for K in K_values
         }
 
-    # -------- long-form rows (one per dataset, layer, K)
-    long_rows: list[dict[str, Any]] = []
-    # -------- per-dataset summary rows
-    summary_rows: list[dict[str, Any]] = []
-
-    for ds in per_ds_counts:
-        # jaccard_at_n_used per layer (needed for both long-form and summary).
-        per_layer_j_at_k_model = [
-            _jaccard(ds_topk[ds][K_model][layer], ref_topk[K_model][layer])
-            for layer in range(L)
-        ]
-        # AUC: build the per-(layer, K) matrix and integrate along K.
-        K_arr = np.asarray(K_values, dtype=np.float64)
-        per_layer_curves = np.zeros((L, len(K_values)), dtype=np.float64)
-        for ki, K in enumerate(K_values):
-            for layer in range(L):
-                per_layer_curves[layer, ki] = _jaccard(
-                    ds_topk[ds][K][layer], ref_topk[K][layer])
-        # Trapezoidal AUC per layer, normalised by K-range so the value
-        # is in [0, 1] and comparable across models with different E.
-        if len(K_values) >= 2:
-            per_layer_auc = np.trapz(per_layer_curves, K_arr, axis=1)
-            k_range = max(float(K_arr.max() - K_arr.min()), 1.0)
-            per_layer_auc = per_layer_auc / k_range
-        else:
-            per_layer_auc = per_layer_curves[:, 0]
-        # Long-form rows for this dataset.
+    # -------- cross-dataset alignment: do all datasets agree on top-K?
+    # Two complementary metrics at each (K, layer):
+    #   jaccard_union[K][layer]         = |∩ A_i| / |∪ A_i|  (strict consensus)
+    #   jaccard_pairwise_mean[K][layer] = mean of all C(N,2) pairwise Jaccards
+    # plus the full N×N pairwise matrix per (K, layer) for the heatmap output.
+    # Single-number-per-K view is the mean-across-layers of each metric.
+    ds_names_sorted = sorted(per_ds_counts.keys())
+    N_ds = len(ds_names_sorted)
+    jaccard_union: dict[int, list[float]] = {K: [0.0] * L for K in K_values}
+    jaccard_pairwise_mean: dict[int, list[float]] = {
+        K: [0.0] * L for K in K_values
+    }
+    pair_matrices: dict[int, np.ndarray] = {}  # K -> [L, N_ds, N_ds]
+    for K in K_values:
+        per_layer_mats = np.zeros((L, N_ds, N_ds), dtype=np.float64)
         for layer in range(L):
-            for ki, K in enumerate(K_values):
-                j_val = float(per_layer_curves[layer, ki])
-                j_at_k_model = per_layer_j_at_k_model[layer]
-                long_rows.append({
-                    "dataset": ds,
-                    "layer": layer,
-                    "K": int(K),
-                    "jaccard": j_val,
-                    "jaccard_n_used": (
-                        float(j_at_k_model) if int(K) == K_model else ""
-                    ),
-                })
-        n_below_0_5 = int(np.sum(
-            np.asarray(per_layer_j_at_k_model, dtype=np.float64) < 0.5))
+            sets_at_kl = [ds_topk[ds][K][layer] for ds in ds_names_sorted]
+            jaccard_union[K][layer] = _generalized_jaccard(sets_at_kl)
+            for i in range(N_ds):
+                per_layer_mats[layer, i, i] = 1.0
+                for j in range(i + 1, N_ds):
+                    jv = _jaccard(sets_at_kl[i], sets_at_kl[j])
+                    per_layer_mats[layer, i, j] = jv
+                    per_layer_mats[layer, j, i] = jv
+            if N_ds >= 2:
+                triu = per_layer_mats[layer][np.triu_indices(N_ds, k=1)]
+                jaccard_pairwise_mean[K][layer] = float(np.mean(triu))
+            else:
+                jaccard_pairwise_mean[K][layer] = 1.0
+        pair_matrices[K] = per_layer_mats
+
+    # Per-dataset "agreement with the rest of the pack" at K=K_model,
+    # averaged across layers. For each dataset, mean Jaccard with every
+    # OTHER dataset at K=K_model (across all layers) plus the worst layer.
+    mean_to_others: dict[str, float] = {}
+    min_to_others: dict[str, float] = {}
+    if N_ds <= 1:
+        for ds in ds_names_sorted:
+            mean_to_others[ds] = 1.0
+            min_to_others[ds] = 1.0
+    else:
+        pair_at_kmodel = pair_matrices[K_model]  # [L, N_ds, N_ds]
+        for i, ds in enumerate(ds_names_sorted):
+            per_layer_means = np.array(
+                [np.mean([pair_at_kmodel[layer, i, j]
+                          for j in range(N_ds) if j != i])
+                 for layer in range(L)],
+                dtype=np.float64,
+            )
+            mean_to_others[ds] = float(np.mean(per_layer_means))
+            min_to_others[ds] = float(np.min(per_layer_means))
+
+    # -------- per-dataset summary rows (cross-dataset alignment only)
+    summary_rows: list[dict[str, Any]] = []
+    for ds in ds_names_sorted:
         summary_rows.append({
             "dataset": ds,
             "tokens": per_ds_tokens[ds],
             "n_rows": next(m["n_rows"] for m in per_ds_meta
                            if m["dataset"] == ds),
-            "jaccard_at_n_used": float(np.mean(per_layer_j_at_k_model)),
-            "jaccard_auc": float(np.mean(per_layer_auc)),
-            "jaccard_at_n_used_per_layer_min":
-                float(np.min(per_layer_j_at_k_model)),
-            "n_layers_below_0.5": n_below_0_5,
+            "mean_jaccard_to_others_at_n_used": mean_to_others[ds],
+            "min_jaccard_to_others_at_n_used": min_to_others[ds],
         })
 
-    # -------- write CSVs
-    long_csv_path = output_dir / "jaccard_sweep.csv"
-    with open(long_csv_path, "w") as f:
-        f.write("dataset,layer,K,jaccard,jaccard_n_used\n")
-        for r in long_rows:
-            jn = r["jaccard_n_used"]
-            f.write(f"{r['dataset']},{r['layer']},{r['K']},"
-                    f"{r['jaccard']:.6f},"
-                    f"{('' if jn == '' else f'{jn:.6f}')}\n")
-    print(f"[save] {long_csv_path}")
-
+    # -------- write summary.csv (cross-dataset alignment only)
     summary_csv_path = output_dir / "summary.csv"
     with open(summary_csv_path, "w") as f:
-        f.write("dataset,tokens,n_rows,jaccard_at_n_used,jaccard_auc,"
-                "jaccard_at_n_used_per_layer_min,n_layers_below_0.5\n")
+        f.write("dataset,tokens,n_rows,"
+                "mean_jaccard_to_others_at_n_used,"
+                "min_jaccard_to_others_at_n_used\n")
         for r in summary_rows:
             f.write(f"{r['dataset']},{r['tokens']},{r['n_rows']},"
-                    f"{r['jaccard_at_n_used']:.6f},"
-                    f"{r['jaccard_auc']:.6f},"
-                    f"{r['jaccard_at_n_used_per_layer_min']:.6f},"
-                    f"{r['n_layers_below_0.5']}\n")
+                    f"{r['mean_jaccard_to_others_at_n_used']:.6f},"
+                    f"{r['min_jaccard_to_others_at_n_used']:.6f}\n")
     print(f"[save] {summary_csv_path}")
 
+    # -------- write cross-dataset CSVs
+    pair_csv_path = output_dir / "jaccard_pairwise.csv"
+    with open(pair_csv_path, "w") as f:
+        f.write("K,layer,dataset_a,dataset_b,jaccard\n")
+        for K in K_values:
+            for layer in range(L):
+                mat = pair_matrices[K][layer]
+                for i in range(N_ds):
+                    for j in range(i + 1, N_ds):
+                        f.write(f"{K},{layer},"
+                                f"{ds_names_sorted[i]},"
+                                f"{ds_names_sorted[j]},"
+                                f"{mat[i, j]:.6f}\n")
+    print(f"[save] {pair_csv_path}")
+
+    global_csv_path = output_dir / "jaccard_global.csv"
+    with open(global_csv_path, "w") as f:
+        f.write("K,layer,jaccard_union,jaccard_pairwise_mean\n")
+        for K in K_values:
+            for layer in range(L):
+                f.write(f"{K},{layer},"
+                        f"{jaccard_union[K][layer]:.6f},"
+                        f"{jaccard_pairwise_mean[K][layer]:.6f}\n")
+    print(f"[save] {global_csv_path}")
+
     # -------- README.json (meta)
+    # Cross-dataset alignment summary at K=K_model (averaged across layers).
+    gj_at_kmodel = float(np.mean(jaccard_union[K_model]))
+    mp_at_kmodel = float(np.mean(jaccard_pairwise_mean[K_model]))
     meta = {
         "cell_dir": str(cell_dir),
         "model_id": model_id or model_id_loaded,
@@ -397,103 +488,158 @@ def process_cell(cell_dir: Path, *, output_dir: Path | None = None,
             "tokens_aggregated": int(tokens_agg),
         },
         "metric": "jaccard",
+        "cross_dataset": {
+            "metric_definition": {
+                "jaccard_union":
+                    "|intersection of top-K sets| / |union of top-K sets| "
+                    "across all datasets (strict consensus; drops fast on outliers)",
+                "jaccard_pairwise_mean":
+                    "mean of all C(N,2) pairwise top-K Jaccards across datasets",
+            },
+            "at_k_n_used": {
+                "jaccard_union_mean_across_layers": gj_at_kmodel,
+                "jaccard_pairwise_mean_mean_across_layers": mp_at_kmodel,
+            },
+            "datasets_sorted": ds_names_sorted,
+        },
     }
     meta_path = output_dir / "README.json"
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2)
     print(f"[save] {meta_path}")
 
-    # -------- jaccard_sweep.png (1 subplot per layer)
-    n_cols = min(4, L)
-    n_rows = (L + n_cols - 1) // n_cols
-    fig_w = 4.2 * n_cols
-    fig_h = 3.0 * n_rows + 0.6  # extra room for suptitle
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(fig_w, fig_h),
-                             squeeze=False)
+    # -------- jaccard_pairwise.png (heatmap at K=K_model, avg across layers)
+    # Three heatmaps in total, all sharing the same Blues colormap and
+    # threshold rule for legible text:
+    #   - K = K_model       (primary;  named jaccard_pairwise.png)
+    #   - K = 2 * K_model   (alias    jaccard_pairwise_K2x.png)
+    #   - K = 3 * K_model   (alias    jaccard_pairwise_K3x.png)
+    # Each heatmap is also written with K embedded in the filename
+    # (jaccard_pairwise_K{K}.png). The 2x/3x Ks may exceed E for very
+    # small models (e.g. Mixtral has E=8, K_model=2 -> 3*K_model=6 ok,
+    # but 2*K_model=4 ok too; for gpt-oss with K_model=4, E=128 -> 12
+    # and 24 always fine). We clamp the 2x/3x Ks to E inside
+    # `_make_k_values` already; here we only render when the K lands
+    # within K_values (otherwise we emit a [warn] and skip).
     model_label = (model_id or model_id_loaded or cell_dir.parent.name)
     quant_label = (quant or cell_dir.name)
-    # Pre-bucket the long_rows by (dataset, layer) -> {K: jaccard} for plotting.
-    by_ds_layer: dict[tuple[str, int], dict[int, float]] = {}
-    for r in long_rows:
-        by_ds_layer.setdefault((r["dataset"], r["layer"]),
-                               {})[int(r["K"])] = float(r["jaccard"])
+    # Candidate Ks for the additional heatmaps, in priority order. We
+    # dedupe against K_model so we don't write the same heatmap twice
+    # on models that overlap (e.g. K_model=8 with 2*8=16 != 3*8=24 but
+    # if K_model=12 and 2*K_model=24 != 3*K_model=36 on E=64, no
+    # collision; we still keep the explicit dedupe for safety).
+    heatmap_ks: list[tuple[int, str]] = [(K_model, "")]
+    heatmap_ks.append((int(min(2 * K_model, E)), "K2x"))
+    heatmap_ks.append((int(min(3 * K_model, E)), "K3x"))
+    rendered_ks: list[int] = []
+    for k_render, alias in heatmap_ks:
+        if k_render not in pair_matrices:
+            print(f"[warn] K={k_render} not in sweep "
+                  f"(K_values={K_values}); skipping extra heatmap")
+            continue
+        if k_render in rendered_ks:
+            # Already rendered under an earlier name; skip the alias.
+            print(f"[skip] K={k_render} already rendered; "
+                  f"suppressing duplicate alias '{alias}'")
+            continue
+        rendered_ks.append(k_render)
+        pair_avg = pair_matrices[k_render].mean(axis=0)  # [N_ds, N_ds]
+        fig_w = max(5.5, N_ds * 1.2 + 1.0)
+        fig_h = max(4.5, N_ds * 1.0 + 0.8)
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+        im = ax.imshow(pair_avg, vmin=0.0, vmax=1.0, cmap="Blues",
+                       aspect="auto")
+        ax.set_xticks(range(N_ds))
+        ax.set_yticks(range(N_ds))
+        ax.set_xticklabels(ds_names_sorted, rotation=30, ha="right",
+                           fontsize=8)
+        ax.set_yticklabels(ds_names_sorted, fontsize=8)
+        ax.set_xlabel("dataset")
+        ax.set_ylabel("dataset")
+        for i in range(N_ds):
+            for j in range(N_ds):
+                v = pair_avg[i, j]
+                # Blues cmap: low v -> near-white, high v -> deep blue.
+                # Diagonal cells (i == j) are always 1.0 -> deep blue,
+                # so they MUST be white; off-diagonal low-overlap cells
+                # are light blue, so they read best in black.
+                color = "black" if v < 0.55 else "white"
+                ax.text(j, i, f"{v:.2f}", ha="center", va="center",
+                        fontsize=9, color=color)
+        ax.set_title(
+            f"{model_label}  -  pairwise top-K expert agreement ({quant_label})\n"
+            f"{arch['name']} L={L} E={E} K={k_render} "
+            f"(={k_render // K_model}x K_model); "
+            f"averaged across {L} layer(s); {N_ds} datasets",
+            fontsize=10,
+        )
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label(f"pairwise Jaccard at K={k_render}", fontsize=8)
+        fig.tight_layout()
+        # Filenames:
+        #   - K = K_model (alias=="")  -> jaccard_pairwise.png
+        #     (kept for backward compat with existing references)
+        #   - K = 2 * K_model / 3 * K_model
+        #     -> jaccard_pairwise_K{K}.png AND jaccard_pairwise_K2x.png /
+        #        K3x.png (one of the two, the {K}-embedded form)
+        pair_png = (output_dir / "jaccard_pairwise.png"
+                    if alias == ""
+                    else output_dir / f"jaccard_pairwise_K{k_render}.png")
+        fig.savefig(pair_png, dpi=dpi, bbox_inches="tight")
+        plt.close(fig)
+        print(f"[save] {pair_png}")
+        if alias in ("K2x", "K3x"):
+            alias_png = output_dir / f"jaccard_pairwise_{alias}.png"
+            if alias_png != pair_png:
+                pair_png.rename(alias_png)
+                print(f"[save] {alias_png}  (renamed)")
+
+    # -------- jaccard_global.png (x=K, y=cross-dataset Jaccard)
+    # Two complementary metrics overlaid; thin per-layer traces underneath
+    # + bold mean-across-layers lines. This is the "single number per K"
+    # view of cross-dataset alignment.
+    K_arr = np.asarray(K_values, dtype=np.float64)
+    union_per_layer = np.array([jaccard_union[K] for K in K_values],
+                               dtype=np.float64).T  # [L, n_K]
+    pairwise_per_layer = np.array(
+        [jaccard_pairwise_mean[K] for K in K_values], dtype=np.float64).T
+    union_mean_curve = union_per_layer.mean(axis=0)
+    pairwise_mean_curve = pairwise_per_layer.mean(axis=0)
+    fig, ax = plt.subplots(figsize=(9.0, 5.0))
+    # Faint per-layer lines for both metrics.
     for layer in range(L):
-        ax = axes[layer // n_cols][layer % n_cols]
-        for ds in per_ds_counts:
-            ys = [by_ds_layer[(ds, layer)].get(K, float("nan"))
-                  for K in K_values]
-            ax.plot(K_values, ys, marker="o", markersize=3,
-                    linewidth=1.0, label=ds)
-        ax.axhline(1.0, color="black", linestyle="--", linewidth=0.8,
-                   label="aggregated (== self)")
-        ax.axvline(K_model, color="red", linestyle=":", linewidth=0.7,
-                   label=f"K_model={K_model}")
-        ax.set_title(f"layer {layer}", fontsize=9)
-        ax.set_xlabel("K", fontsize=8)
-        ax.set_ylabel("Jaccard", fontsize=8)
-        ax.set_ylim(-0.02, 1.05)
-        ax.tick_params(axis="both", labelsize=7)
-        ax.grid(True, linestyle=":", alpha=0.4)
-        if layer == 0:
-            ax.legend(fontsize=6, loc="lower right")
-    for layer in range(L, n_rows * n_cols):
-        axes[layer // n_cols][layer % n_cols].axis("off")
-    fig.suptitle(
-        f"{model_label}  -  Jaccard K-sweep vs aggregated reference ({quant_label})\n"
-        f"{arch['name']} L={L} E={E} K_model={K_model}; "
-        f"tokens aggregated={tokens_agg:,}; K-sweep size={len(K_values)}",
-        fontsize=10,
-    )
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
-    sweep_png = output_dir / "jaccard_sweep.png"
-    fig.savefig(sweep_png, dpi=dpi, bbox_inches="tight")
-    plt.close(fig)
-    print(f"[save] {sweep_png}")
-
-    # -------- jaccard_vs_n_used.png (bar chart at K=K_model, per dataset)
-    ds_names = [r["dataset"] for r in summary_rows]
-    means = [r["jaccard_at_n_used"] for r in summary_rows]
-    mins = [r["jaccard_at_n_used_per_layer_min"] for r in summary_rows]
-    x = np.arange(len(ds_names))
-    fig, ax = plt.subplots(figsize=(max(7, len(ds_names) * 1.4), 4.5))
-    ax.bar(x, means, color="#4477aa", edgecolor="black", linewidth=0.4,
-           label="mean across layers")
-    ax.scatter(x, mins, color="red", marker="v", s=40, zorder=5,
-               label="min across layers")
-    for xi, m, mn in zip(x, means, mins):
-        ax.text(xi, max(m, mn) + 0.02,
-                f"{m:.2f}\n(min {mn:.2f})",
-                ha="center", va="bottom", fontsize=7)
+        ax.plot(K_arr, union_per_layer[layer], color="#4477aa",
+                alpha=0.15, linewidth=0.7)
+        ax.plot(K_arr, pairwise_per_layer[layer], color="#cc6677",
+                alpha=0.15, linewidth=0.7)
+    # Bold mean-across-layers lines.
+    ax.plot(K_arr, union_mean_curve, color="#4477aa", linewidth=2.4,
+            marker="o", markersize=4,
+            label="generalized Jaccard  (|∩|/|∪|)")
+    ax.plot(K_arr, pairwise_mean_curve, color="#cc6677", linewidth=2.4,
+            marker="s", markersize=4,
+            label="mean pairwise Jaccard")
+    ax.axvline(K_model, color="black", linestyle=":", linewidth=0.8,
+               label=f"K_model={K_model}")
     ax.axhline(1.0, color="black", linestyle="--", linewidth=0.6,
-               label="1.0 (perfect)")
-    ax.set_xticks(x)
-    ax.set_xticklabels(ds_names, rotation=20, ha="right", fontsize=8)
-    ax.set_xlabel("dataset")
-    ax.set_ylabel(f"Jaccard at K={K_model}")
-    ax.set_ylim(-0.02, 1.18)
+               label="perfect agreement")
+    ax.set_xlabel("K")
+    ax.set_ylabel("cross-dataset Jaccard")
+    ax.set_ylim(-0.02, 1.05)
     ax.set_title(
-        f"{model_label}  -  per-dataset Jaccard at K=K_model={K_model} ({quant_label})\n"
-        f"{arch['name']} L={L} E={E}; aggregated reference = top-{K_model} "
-        f"by total tokens across {len(per_ds_counts)} dataset(s)",
+        f"{model_label}  -  cross-dataset top-K alignment ({quant_label})\n"
+        f"{arch['name']} L={L} E={E} K_model={K_model}; "
+        f"{N_ds} datasets; {tokens_agg:,} aggregated tokens\n"
+        f"thin lines = per-layer; bold lines = mean across layers",
         fontsize=10,
     )
-    ax.grid(True, axis="y", linestyle=":", alpha=0.4)
-    ax.legend(fontsize=8, loc="upper right")
+    ax.legend(fontsize=8, loc="lower right")
+    ax.grid(True, linestyle=":", alpha=0.4)
     fig.tight_layout()
-    vs_used_png = output_dir / "jaccard_vs_n_used.png"
-    fig.savefig(vs_used_png, dpi=dpi, bbox_inches="tight")
+    global_png = output_dir / "jaccard_global.png"
+    fig.savefig(global_png, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
-    print(f"[save] {vs_used_png}")
-
-    # -------- acceptance check: warn on per-dataset layer min < 0.20
-    # for the longest dataset (spec §9.2: warn any layer < 0.20 in moe-mmlu
-    # for OLMoE). We don't restrict to moe-mmlu here because the longest
-    # dataset is model-dependent; we flag anything below 0.20.
-    for r in summary_rows:
-        if r["jaccard_at_n_used_per_layer_min"] < 0.20:
-            print(f"[warn] {r['dataset']} has at least one layer with "
-                  f"jaccard@K={K_model} < 0.20 "
-                  f"(min={r['jaccard_at_n_used_per_layer_min']:.3f})")
+    print(f"[save] {global_png}")
 
     return {
         "cell_dir": str(cell_dir),
@@ -596,8 +742,10 @@ def main() -> int:
         "--k-min", type=int, default=1,
         help="Minimum K in the sweep (default: 1).")
     parser.add_argument(
-        "--k-max-frac", type=float, default=0.20,
-        help="K_max = ceil(n_expert * k_max_frac) (default: 0.20).")
+        "--k-max-frac", type=float, default=0.50,
+        help="K_max = ceil(n_expert * k_max_frac) (default: 0.50). "
+             "Default chosen so the 2x K_model and 3x K_model must-include "
+             "points (clamped to E) land inside the sweep on common models.")
     parser.add_argument(
         "--num-ks", type=int, default=21,
         help="Number of K values in the linear sweep (default: 21).")

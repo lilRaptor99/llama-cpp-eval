@@ -4,23 +4,38 @@
 """Cross-dataset aggregator for MoE expert-routing statistics.
 
 Walks every `expert_counts.json` produced by the per-dataset
-`llama-eval-moe-*` C++ binaries under `<results-dir>/<model>/moe-*/`,
-sums the [n_layer, n_expert] count matrices across all datasets for
-each model, and writes one overview set of artifacts per model under
-`<results-dir>/<model>/overall/`.
+`llama-eval-moe-*` C++ binaries under the new model-quantization
+directory structure:
 
-Per model, the script writes:
-  - routing_heatmap_overview.png             L x E selections/token heatmap
-  - routing_heatmap_overview_highlighted.png same heatmap with top-K cells outlined
+    <results-dir>/<model>/<quant>/moe-*/expert_counts.json
+
+For each `(model, quant)` cell it sums the [n_layer, n_expert] count
+matrices across all datasets and writes one overview set of artifacts
+under:
+
+    <results-dir>/<model>/<quant>/overall/
+
+A legacy (no-quant) layout is also tolerated for backward compatibility:
+
+    <results-dir>/<model>/moe-*/expert_counts.json
+        -> <results-dir>/<model>/overall/      (quant_name = "")
+
+Per (model, quant) cell, the script writes:
+  - routing_heatmap_overview.png             L x E circle grid, blue gradient,
+                                             linear scale of raw counts
+  - routing_heatmap_overview_highlighted.png same heatmap with red rings
+                                             around top-K cells per layer
   - top_experts_bars.png                     per-layer bar chart of top-K counts
   - top_experts.json                         per-layer top-K list + statistics
   - counts_total_overview.json               raw aggregated L x E matrix (sum of counts)
-  - metadata_overview.json                   model + arch + per-dataset token split
+  - metadata_overview.json                   model + arch + quant + per-dataset token split
 
 Aggregation: sum raw counts across datasets, divide by total tokens
-(prefill + generated; mmlu uses `subjects.<subj>.n_tokens`) to get
-selections/token. This matches the existing per-dataset
-`save_overview_heatmap` convention.
+(prefill + generated; mmlu uses `subjects.<subj>.n_tokens`) to get the
+per-token rate that `top_k / n_expert` is compared against in the
+metadata. The PNG heatmaps themselves use raw counts (no per-token
+normalisation) to match the visual style of the routing-graph
+heatmaps in `eval-moe-mmlu/routing_graph_from_cpp.py`.
 
 Top-K: ceil(n_expert * --top-k-fraction) experts per layer, ranked by
 aggregated count desc. Default fraction is 0.125 (so 16/8/1/8 experts
@@ -38,11 +53,33 @@ import json
 import math
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
+import matplotlib.colors as mcolors
+from matplotlib.cm import ScalarMappable
+from matplotlib.ticker import FuncFormatter
+
+
+# --------------------------------------------------------------------------- constants
+
+# Highlight ring colour copied from eval-moe-mmlu/routing_graph_from_cpp.py
+# so the overview heatmap's top-K highlight matches the routing graph's.
+# The overview heatmap uses a THINNER ring than the routing graph
+# (routing_graph uses 4.0; here we use 1.5) because the overview circles
+# are much smaller in data-units per expert, so 4.0 visually dominates them.
+HIGHLIGHT_EDGE_COLOR = "#ff1744"  # red (matches routing_graph_from_cpp.py)
+HIGHLIGHT_EDGE_WIDTH = 1.5
+# Vertical spacing between layer rows in the circle-grid heatmap. Picked
+# so that adjacent-row circles don't overlap (circle_radius = 0.40 of
+# col_spacing = 1.0).
+DEFAULT_OVERVIEW_COL_SPACING = 1.0
+DEFAULT_OVERVIEW_ROW_SPACING = 1.5
+# Default colormap for the circle-grid heatmap. The user explicitly asked
+# for the same blue gradient as the routing graph, so it is no longer
+# configurable via the CLI.
+DEFAULT_OVERVIEW_COLORMAP = "Blues"
 
 
 # --------------------------------------------------------------------------- I/O
@@ -134,19 +171,41 @@ def _load_one(path: Path, default_L: int = 16, default_E: int = 64,
 
 
 def _discover_results(results_dir: Path, only_models: list[str] | None,
-                      ) -> list[tuple[Path, list[Path]]]:
-    """Find all `<model>/moe-*/expert_counts.json` under results_dir.
+                      ) -> list[tuple[Path, list[Path], str]]:
+    """Find all `<model>/<quant>/moe-*/expert_counts.json` under results_dir.
 
-    Returns a list of (model_dir, [json_paths]) sorted by model name.
-    Models without any usable JSON files are dropped from the output.
+    New structure (preferred):
+        <results-dir>/<model>/<quant>/moe-*/expert_counts.json
+
+    Legacy structure (still supported, no quant):
+        <results-dir>/<model>/moe-*/expert_counts.json
+
+    Returns a list of ``(model_dir, json_paths, quant_name)`` tuples sorted
+    by model name then quant name. Models without any usable JSON files are
+    dropped from the output. When the legacy layout is used, ``quant_name``
+    is the empty string and ``model_dir`` is the cell directory itself.
     """
-    found: list[tuple[Path, list[Path]]] = []
+    found: list[tuple[Path, list[Path], str]] = []
     for model_dir in sorted(p for p in results_dir.iterdir() if p.is_dir()):
         if only_models and model_dir.name not in only_models:
             continue
-        json_paths = sorted(model_dir.glob("moe-*/expert_counts.json"))
-        if json_paths:
-            found.append((model_dir, json_paths))
+
+        # Try the new structure first: <model>/<quant>/moe-*/expert_counts.json.
+        # The cell directory is the same as the quant directory in that case.
+        per_cell: list[tuple[Path, str, list[Path]]] = []
+        for sub in sorted(p for p in model_dir.iterdir() if p.is_dir()):
+            json_paths = sorted(sub.glob("moe-*/expert_counts.json"))
+            if json_paths:
+                per_cell.append((sub, sub.name, json_paths))
+
+        if not per_cell:
+            # Fall back to legacy: <model>/moe-*/expert_counts.json.
+            json_paths = sorted(model_dir.glob("moe-*/expert_counts.json"))
+            if json_paths:
+                per_cell.append((model_dir, "", json_paths))
+
+        for cell_dir, quant_name, json_paths in per_cell:
+            found.append((model_dir, json_paths, quant_name))
     return found
 
 
@@ -212,71 +271,207 @@ def compute_per_dataset_top_k(per_dataset_counts: dict[str, np.ndarray],
 
 # ----------------------------------------------------------- heatmap renderers
 
+def _colorbar_millions_formatter(x: float, pos: int) -> str:
+    """Colorbar tick formatter that prints in millions (e.g. 40.0M)."""
+    if x >= 1e6:
+        return f"{x / 1e6:.1f}M"
+    if x >= 1e3:
+        return f"{x / 1e3:.1f}K"
+    return f"{int(x)}"
+
+
+def _draw_circle_grid_overview(
+    counts: np.ndarray,
+    total_tokens: int,
+    model_id: str,
+    arch: dict[str, Any],
+    top_k: int,
+    top_k_count: int,
+    top_k_per_layer: Optional[list[list[dict[str, Any]]]],
+    path: Path,
+    *,
+    dpi: int = 120,
+    colormap: str = DEFAULT_OVERVIEW_COLORMAP,
+    quant: str = "",
+) -> None:
+    """Render the overview heatmap as a circle grid (mirrors routing_graph).
+
+    Layout: L rows (one per layer) × E columns (one per expert). Each cell
+    is a circle whose fill is linearly scaled to the raw activation count
+    (Blues colormap by default, no log scale). When ``top_k_per_layer`` is
+    provided, a thick red ring is drawn around each top-K cell per layer
+    (matching the highlight style used by the routing graph in
+    ``eval-moe-mmlu/routing_graph_from_cpp.py``).
+
+    The figure axes are inverted so layer 0 sits at the top. Both axes
+    are turned off; integer layer/expert tick labels are drawn manually
+    next to the left edge and below the bottom row.
+    """
+    L, E = counts.shape
+
+    # ---- grid geometry (decoupled col/row spacing so we can tune both) ----
+    col_spacing = DEFAULT_OVERVIEW_COL_SPACING
+    row_spacing = DEFAULT_OVERVIEW_ROW_SPACING
+    circle_radius = col_spacing * 0.40
+
+    # ---- figure sizing (auto-scaled to model shape) ----
+    width = max(10.0, E * col_spacing * 0.35)
+    height = max(5.0, L * row_spacing * 0.60)
+    fig, ax = plt.subplots(figsize=(width, height), dpi=dpi)
+    ax.set_aspect("equal")
+    ax.axis("off")
+
+    # ---- linear normalisation for the circle fill (NO log scale) ----
+    counts_f = counts.astype(np.float64)
+    global_max = float(counts_f.max()) if counts_f.size > 0 else 1.0
+    if global_max <= 0:
+        global_max = 1.0
+    norm = mcolors.Normalize(vmin=0.0, vmax=global_max)
+    cmap = plt.get_cmap(colormap)
+
+    # ---- compute (x, y) centres on a simple grid (L rows, E cols) ----
+    pos = np.zeros((L, E, 2), dtype=np.float64)
+    for layer in range(L):
+        for e in range(E):
+            pos[layer, e, 0] = e * col_spacing
+            pos[layer, e, 1] = layer * row_spacing
+
+    # ---- expert circles: per-expert activation fill ----
+    edge_color = "#bdbdbd"  # light grey border so zero-count circles are visible
+    for layer in range(L):
+        for e in range(E):
+            x, y = pos[layer, e]
+            facecolor = cmap(norm(counts_f[layer, e]))
+            circ = plt.Circle(
+                (x, y), circle_radius,
+                facecolor=facecolor,
+                edgecolor=edge_color,
+                linewidth=0.5,
+                zorder=2,
+            )
+            ax.add_patch(circ)
+
+    # ---- highlight rings: red rings around top-K cells per layer ----
+    if top_k_per_layer is not None:
+        for layer, layer_top in enumerate(top_k_per_layer):
+            for entry in layer_top:
+                eid = entry["expert_id"]
+                x, y = pos[layer, eid]
+                ring = plt.Circle(
+                    (x, y), circle_radius * 1.08,
+                    facecolor="none",
+                    edgecolor=HIGHLIGHT_EDGE_COLOR,
+                    linewidth=HIGHLIGHT_EDGE_WIDTH,
+                    zorder=3,
+                )
+                ax.add_patch(ring)
+
+    # ---- axis limits (with margin for layer/expert labels) ----
+    if L > 0 and E > 0:
+        x_min = -col_spacing * 1.5
+        x_max = float(pos[:, :, 0].max()) + col_spacing * 1.5
+        y_min = -row_spacing * 0.5
+        y_max = float(pos[:, :, 1].max()) + row_spacing * 0.4
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(y_max, y_min)  # invert so L0 is at top
+
+    # ---- layer labels (left, right-aligned) ----
+    for layer in range(L):
+        y = float(pos[layer, 0, 1])
+        ax.text(
+            -col_spacing * 0.4, y, f"{layer}",
+            ha="right", va="center",
+            fontsize=8, color="#333", family="monospace",
+        )
+
+    # ---- expert index labels (bottom, centred under each column) ----
+    for e in range(E):
+        x = float(pos[L - 1, e, 0])
+        ax.text(
+            x, -row_spacing * 0.55, f"{e}",
+            ha="center", va="top",
+            fontsize=8, color="#333", family="monospace",
+        )
+
+    # ---- axis labels ----
+    if L > 0 and E > 0:
+        ax.text(
+            -col_spacing * 1.1, float(pos[:, :, 1].mean()),
+            "Layer Index", rotation=90, ha="center", va="center",
+            fontsize=10, color="#333",
+        )
+        ax.text(
+            float(pos[:, :, 0].mean()), -row_spacing * 1.0,
+            "Expert Index (within same layer)", ha="center", va="top",
+            fontsize=10, color="#333",
+        )
+
+    # ---- colorbar for circle fill (raw counts, linear scale) ----
+    sm = ScalarMappable(norm=norm, cmap=cmap)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax, fraction=0.025, pad=0.02)
+    cbar.set_label("Raw activation count (linear scale)", fontsize=10)
+    cbar.ax.yaxis.set_major_formatter(FuncFormatter(_colorbar_millions_formatter))
+
+    # ---- title ----
+    quant_str = f"  -  quant: {quant}" if quant else ""
+    highlight_str = (
+        f"\nRed ring = top {top_k_count} experts per layer"
+        if top_k_per_layer is not None
+        else f"\nTop {top_k_count} experts per layer shown in the highlighted variant"
+    )
+    ax.set_title(
+        f"{model_id}{quant_str}  -  MoE expert activation counts "
+        f"(top-{top_k} of {E})\n"
+        f"aggregated across all datasets; {total_tokens:,} tokens"
+        f"{highlight_str}",
+        fontsize=11, pad=14,
+    )
+
+    # ---- save ----
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
 def save_overview_heatmap(counts: np.ndarray, total_tokens: int,
                           model_id: str, arch: dict[str, Any],
                           top_k: int, top_k_count: int,
-                          path: Path, *, colormap: str = "viridis",
-                          dpi: int = 120) -> None:
-    """Layer x expert heatmap of per-token activation rate."""
-    L, E = counts.shape
-    per_token = counts.astype(np.float64) / max(total_tokens, 1)
+                          path: Path, *, dpi: int = 120,
+                          quant: str = "") -> None:
+    """Overview heatmap: L x E circle grid, blue gradient, linear scale.
 
-    fig, ax = plt.subplots(figsize=(max(14, E * 0.32), max(4, L * 0.5)))
-    im = ax.imshow(per_token, aspect="auto", cmap=colormap)
-    ax.set_xlabel("expert id")
-    ax.set_ylabel("layer")
-    ax.set_title(
-        f"{model_id}  -  per-token MoE activation rate (top-{top_k} of {E})\n"
-        f"aggregated across all datasets; {total_tokens:,} tokens; "
-        f"top {top_k_count} highlighted in next plot"
+    Visual style mirrors the routing graph in
+    ``eval-moe-mmlu/routing_graph_from_cpp.py``: one circle per expert on
+    a decoupled grid, circle fill linearly scaled to the **raw** activation
+    count (no per-token normalisation). No highlight rings here — see
+    ``save_highlighted_heatmap`` for the top-K variant.
+    """
+    _draw_circle_grid_overview(
+        counts, total_tokens, model_id, arch, top_k, top_k_count,
+        top_k_per_layer=None, path=path, dpi=dpi,
+        quant=quant,
     )
-    plt.colorbar(
-        im, ax=ax,
-        label=f"selections / token (uniform = {top_k / E:.4f})",
-    )
-    fig.tight_layout()
-    fig.savefig(path, dpi=dpi, bbox_inches="tight")
-    plt.close(fig)
 
 
 def save_highlighted_heatmap(counts: np.ndarray, total_tokens: int,
                               model_id: str, arch: dict[str, Any],
                               top_k: int, top_k_count: int,
                               top_k_per_layer: list[list[dict[str, Any]]],
-                              path: Path, *, colormap: str = "viridis",
-                              dpi: int = 120) -> None:
-    """Same overview heatmap with each top-K cell outlined in red."""
-    L, E = counts.shape
-    per_token = counts.astype(np.float64) / max(total_tokens, 1)
+                              path: Path, *, dpi: int = 120,
+                              quant: str = "") -> None:
+    """Same overview heatmap with red rings around top-K cells per layer.
 
-    fig, ax = plt.subplots(figsize=(max(14, E * 0.32), max(4, L * 0.5)))
-    im = ax.imshow(per_token, aspect="auto", cmap=colormap)
-    ax.set_xlabel("expert id")
-    ax.set_ylabel("layer")
-    ax.set_title(
-        f"{model_id}  -  per-token MoE activation rate (top-{top_k} of {E})\n"
-        f"top {top_k_count} experts per layer outlined in red; "
-        f"{total_tokens:,} tokens aggregated"
+    Identical to ``save_overview_heatmap`` except that each top-K cell
+    (per layer) is overlaid with a thick red ring. The ring style
+    (colour, width) matches the highlight ring used by the routing graph
+    in ``eval-moe-mmlu/routing_graph_from_cpp.py``.
+    """
+    _draw_circle_grid_overview(
+        counts, total_tokens, model_id, arch, top_k, top_k_count,
+        top_k_per_layer=top_k_per_layer, path=path, dpi=dpi,
+        quant=quant,
     )
-    plt.colorbar(
-        im, ax=ax,
-        label=f"selections / token (uniform = {top_k / E:.4f})",
-    )
-
-    # Overlay red rectangles on the top-K cells. imshow maps each cell
-    # to the rectangle [col-0.5, col+0.5] x [row-0.5, row+0.5].
-    for layer, layer_top in enumerate(top_k_per_layer):
-        for entry in layer_top:
-            eid = entry["expert_id"]
-            rect = Rectangle(
-                (eid - 0.5, layer - 0.5), 1.0, 1.0,
-                fill=False, edgecolor="red", linewidth=1.5,
-            )
-            ax.add_patch(rect)
-
-    fig.tight_layout()
-    fig.savefig(path, dpi=dpi, bbox_inches="tight")
-    plt.close(fig)
 
 
 def save_top_k_bar_chart(counts: np.ndarray,
@@ -351,9 +546,9 @@ def save_top_k_bar_chart(counts: np.ndarray,
 
 def process_model(model_dir: Path, json_paths: list[Path],
                   output_dir: Path, top_k_fraction: float,
-                  include_per_dataset: bool, *, colormap: str,
-                  dpi: int) -> dict[str, Any]:
-    """Aggregate one model's datasets and write the overview artifacts.
+                  include_per_dataset: bool, *, dpi: int,
+                  quant: str = "") -> dict[str, Any]:
+    """Aggregate one (model, quant) cell's datasets and write the overview artifacts.
 
     Returns a summary dict for stdout reporting.
     """
@@ -446,20 +641,19 @@ def process_model(model_dir: Path, json_paths: list[Path],
             )
 
     # ----------------------------------------------------------------- persist
-    # 1. Overview heatmap (selections/token).
+    # 1. Overview heatmap (circle grid, blue gradient, linear raw counts).
     p = output_dir / "routing_heatmap_overview.png"
     save_overview_heatmap(
         counts_total, total_tokens, model_id or model_dir.name, arch,
-        top_k, top_k_count, p, colormap=colormap, dpi=dpi,
+        top_k, top_k_count, p, dpi=dpi, quant=quant,
     )
     print(f"[save] {p}")
 
-    # 2. Highlighted heatmap.
+    # 2. Highlighted heatmap (same circle grid + red rings on top-K per layer).
     p = output_dir / "routing_heatmap_overview_highlighted.png"
     save_highlighted_heatmap(
         counts_total, total_tokens, model_id or model_dir.name, arch,
-        top_k, top_k_count, top_k_per_layer, p,
-        colormap=colormap, dpi=dpi,
+        top_k, top_k_count, top_k_per_layer, p, dpi=dpi, quant=quant,
     )
     print(f"[save] {p}")
 
@@ -524,6 +718,7 @@ def process_model(model_dir: Path, json_paths: list[Path],
     meta = {
         "model": model_id,
         "model_arch": arch,
+        "quant": quant,
         "top_k_fraction": top_k_fraction,
         "top_k_count": top_k_count,
         "aggregation_method": "sum_counts_divide_by_total_tokens",
@@ -545,6 +740,7 @@ def process_model(model_dir: Path, json_paths: list[Path],
     return {
         "model_dir": model_dir,
         "model_id": model_id,
+        "quant": quant,
         "arch": arch,
         "top_k_count": top_k_count,
         "tokens_total": total_tokens,
@@ -564,7 +760,7 @@ def main() -> int:
     parser.add_argument(
         "--results-dir", type=Path, default=Path("build/results"),
         help="Root directory containing per-model subdirectories "
-             "(each with moe-*/expert_counts.json).",
+             "(each with <quant>/moe-*/expert_counts.json).",
     )
     parser.add_argument(
         "--top-k-fraction", type=float, default=0.125,
@@ -579,8 +775,11 @@ def main() -> int:
         "--models", action="append", default=None,
         help="Restrict to a subset of model directory names (repeatable).",
     )
-    parser.add_argument("--colormap", type=str, default="viridis",
-                        help="Matplotlib colormap name.")
+    parser.add_argument(
+        "--quants", action="append", default=None,
+        help="Restrict to a subset of quantization directory names "
+             "(repeatable). Default: process all quants found.",
+    )
     parser.add_argument("--dpi", type=int, default=120,
                         help="Output PNG DPI.")
     args = parser.parse_args()
@@ -592,29 +791,51 @@ def main() -> int:
     print(f"[load] results_dir = {results_dir.resolve()}")
     discovered = _discover_results(results_dir, args.models)
     if not discovered:
-        raise SystemExit(f"[error] no <model>/moe-*/expert_counts.json found under {results_dir}")
+        raise SystemExit(
+            f"[error] no <model>/<quant>/moe-*/expert_counts.json (or legacy "
+            f"<model>/moe-*/expert_counts.json) found under {results_dir}"
+        )
+
+    # Apply --quants filter now (it's per-cell, not per-model).
+    if args.quants:
+        wanted = set(args.quants)
+        discovered = [d for d in discovered if d[2] in wanted]
+        if not discovered:
+            raise SystemExit(
+                f"[error] --quants={args.quants} matches no discovered cells"
+            )
 
     summaries: list[dict[str, Any]] = []
-    for model_dir, json_paths in discovered:
-        print(f"\n[model] {model_dir.name}: {len(json_paths)} dataset JSON(s)")
-        output_dir = model_dir / "overall"
+    for model_dir, json_paths, quant in discovered:
+        label = f"{model_dir.name}" + (f"/{quant}" if quant else " (legacy)")
+        print(f"\n[model] {label}: {len(json_paths)} dataset JSON(s)")
+        # Output directory lives inside the per-quantization directory when
+        # the new structure is in use; under the model directory for legacy.
+        output_dir = (
+            (model_dir / quant / "overall") if quant
+            else (model_dir / "overall")
+        )
         summary = process_model(
             model_dir, json_paths, output_dir,
             top_k_fraction=args.top_k_fraction,
             include_per_dataset=args.include_per_dataset,
-            colormap=args.colormap, dpi=args.dpi,
+            dpi=args.dpi, quant=quant,
         )
         summaries.append(summary)
 
     # Stdout summary table.
     print("\n[summary]")
-    cols = ("model", "arch", "LxE", "top_k", "datasets", "tokens")
-    print("  ".join(f"{c:<28}" if c != "LxE" else f"{c:<10}" for c in cols))
+    cols = ("model", "quant", "arch", "LxE", "top_k", "datasets", "tokens")
+    header_widths = {"LxE": 10, "top_k": 6, "datasets": 8}
+    print("  ".join(
+        f"{c:<{header_widths.get(c, 28)}}" for c in cols
+    ))
     for s in summaries:
         arch = s["arch"]
         print(
             "  ".join([
                 f"{(s['model_id'] or s['model_dir'].name):<28}",
+                f"{(s['quant'] or '-'):<28}",
                 f"{arch['name']:<28}",
                 f"{arch['n_layer']}x{arch['n_expert']:<6}",
                 f"{s['top_k_count']:<6}",
@@ -622,8 +843,11 @@ def main() -> int:
                 f"{s['tokens_total']:,}",
             ])
         )
-    print(f"\n[done] wrote overview artifacts to <model>/overall/ for "
-          f"{len(summaries)} model(s)")
+    n_models = len({s['model_dir'].name for s in summaries})
+    n_quants = len({s['quant'] for s in summaries})
+    print(f"\n[done] wrote overview artifacts for {len(summaries)} "
+          f"(model, quant) cell(s) across {n_models} model(s) / "
+          f"{n_quants} quant(s)")
     return 0
 
 

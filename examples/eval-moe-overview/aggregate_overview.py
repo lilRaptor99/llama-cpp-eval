@@ -22,13 +22,21 @@ A legacy (no-quant) layout is also tolerated for backward compatibility:
 
 Per (model, quant) cell, the script writes:
   - routing_heatmap_overview.png             L x E circle grid, blue gradient,
-                                             linear scale of raw counts
+                                             linear scale of raw counts, plus
+                                             top-K adjacent-layer co-activation
+                                             lines (mirrors eval-moe-mmlu
+                                             routing_graph_from_cpp.py)
   - routing_heatmap_overview_highlighted.png same heatmap with red rings
                                              around top-K cells per layer
+                                             (and the same co-activation lines)
   - top_experts_bars.png                     per-layer bar chart of top-K counts
   - top_experts.json                         per-layer top-K list + statistics
-  - counts_total_overview.json               raw aggregated L x E matrix (sum of counts)
-  - metadata_overview.json                   model + arch + quant + per-dataset token split
+  - counts_total_overview.json               raw aggregated L x E matrix (sum of
+                                             counts) + aggregated
+                                             adjacent_pair_counts (when present
+                                             in the per-dataset JSONs)
+  - metadata_overview.json                   model + arch + quant + per-dataset
+                                             token split + aggregate-block coverage
 
 Aggregation: sum raw counts across datasets, divide by total tokens
 (prefill + generated; mmlu uses `subjects.<subj>.n_tokens`) to get the
@@ -73,13 +81,26 @@ HIGHLIGHT_EDGE_COLOR = "#ff1744"  # red (matches routing_graph_from_cpp.py)
 HIGHLIGHT_EDGE_WIDTH = 1.5
 # Vertical spacing between layer rows in the circle-grid heatmap. Picked
 # so that adjacent-row circles don't overlap (circle_radius = 0.40 of
-# col_spacing = 1.0).
-DEFAULT_OVERVIEW_COL_SPACING = 1.0
-DEFAULT_OVERVIEW_ROW_SPACING = 1.5
+# col_spacing = 1.0). Larger than 0.4 lets the cross-layer connection
+# lines have a clearly visible vertical distance to traverse (the routing
+# graph uses 2.5; we use 1.5 here because the overview grid is denser).
+DEFAULT_OVERVIEW_COL_SPACING = 1.5
+DEFAULT_OVERVIEW_ROW_SPACING = 2.5
 # Default colormap for the circle-grid heatmap. The user explicitly asked
 # for the same blue gradient as the routing graph, so it is no longer
 # configurable via the CLI.
 DEFAULT_OVERVIEW_COLORMAP = "Blues"
+# Top-K co-activation pairs (adjacent-layer) to draw on the overview
+# heatmap, mirroring the routing graph in eval-moe-mmlu. Default 64 is
+# the routing graph's DEFAULT_TOP_K_PAIRS; --top-k-pairs 0 disables lines.
+DEFAULT_OVERVIEW_TOP_K_PAIRS = 24
+# Line colour and width-scale for the cross-layer connection lines, copied
+# from the routing graph so the two plots have the same visual contract.
+PAIR_LINE_COLOR = "#1f3a93"  # dark blue (matches routing_graph_from_cpp.py)
+# line width = 0.1 + line_scale * raw_count. OLMoE-scale counts (~1e7)
+# want ~1e-7; Mixtral-scale counts (~1e6) want ~1e-6. Default 5e-7 is
+# the routing graph's default and works across the models in this repo.
+DEFAULT_OVERVIEW_LINE_SCALE = 4e-7
 
 
 # --------------------------------------------------------------------------- I/O
@@ -100,6 +121,9 @@ def _load_one(path: Path, default_L: int = 16, default_E: int = 64,
       n_rows           : int (number of tasks / subjects / props / langdoms)
       dataset_label    : str (moe-<humaneval|bigbench|mmlu|popqa|include>, derived from path)
       per_dataset_meta : dict (tokens, n_rows, n_questions)
+      marginal         : np.ndarray [L, E] int64, or None (aggregate.marginal_expert_counts)
+      adj              : np.ndarray [L-1, E, E] int64, or None (aggregate.adjacent_pair_counts)
+      has_aggregate    : bool (True iff both marginal and adj were loaded)
     """
     with open(path) as f:
         data = json.load(f)
@@ -147,6 +171,29 @@ def _load_one(path: Path, default_L: int = 16, default_E: int = 64,
         # n_questions / n_correct / match_rate appear in different datasets.
         n_questions += int(body.get("questions", 0))
 
+    # ---- optional aggregate block (marginal + adjacent pair counts) ----
+    # The aggregate block is emitted by the updated per-dataset C++ binaries
+    # (with co-activation capture). Older binaries lack it; we tolerate
+    # that and just leave the aggregate fields as None so the overview
+    # can fall back to the count-only heatmap.
+    marginal: np.ndarray | None = None
+    adj: np.ndarray | None = None
+    agg = data.get("aggregate")
+    if isinstance(agg, dict):
+        marg_raw = agg.get("marginal_expert_counts")
+        if marg_raw is not None:
+            marg_arr = np.asarray(marg_raw, dtype=np.int64)
+            if marg_arr.shape == (L, E):
+                marginal = marg_arr
+        adj_raw = agg.get("adjacent_pair_counts", [])
+        if isinstance(adj_raw, list) and len(adj_raw) == 0:
+            adj_arr = np.zeros((max(L - 1, 0), E, E), dtype=np.int64)
+        elif adj_raw:
+            adj_arr = np.asarray(adj_raw, dtype=np.int64)
+            if adj_arr.shape == (max(L - 1, 0), E, E):
+                adj = adj_arr
+    has_aggregate = (marginal is not None) and (adj is not None)
+
     dataset_label = path.parent.name  # e.g. "moe-humaneval"
     return {
         "arch": {
@@ -161,6 +208,9 @@ def _load_one(path: Path, default_L: int = 16, default_E: int = 64,
         "n_questions": n_questions,
         "dataset_label": dataset_label,
         "model_id": data.get("model"),
+        "marginal": marginal,
+        "adj": adj,
+        "has_aggregate": has_aggregate,
         "per_dataset_meta": {
             "dataset": dataset_label,
             "tokens": int(total_tokens),
@@ -280,6 +330,35 @@ def _colorbar_millions_formatter(x: float, pos: int) -> str:
     return f"{int(x)}"
 
 
+def _filter_top_k_pairs(adj: np.ndarray, K: int) -> list[list[tuple[int, int, int]]]:
+    """For each layer pair L, return the top-K (e_i, e_j, count) triples.
+
+    Mirror of ``eval-moe-mmlu/routing_graph_from_cpp.py::filter_top_k_pairs``
+    so the overview and the routing graph pick the same set of edges when
+    given the same aggregate block and K. Zero-count entries are dropped.
+    K is capped at E*E defensively.
+    """
+    if adj.shape[0] == 0:
+        return []
+
+    L_pairs, E, _ = adj.shape
+    K_eff = min(K, E * E)
+
+    out: list[list[tuple[int, int, int]]] = []
+    for L_ in range(L_pairs):
+        flat = adj[L_].reshape(-1)
+        if K_eff >= flat.size:
+            nz_idx = np.flatnonzero(flat)
+            triples = [(int(idx // E), int(idx % E), int(flat[idx])) for idx in nz_idx]
+            triples.sort(key=lambda t: t[2], reverse=True)
+        else:
+            top_idx = np.argpartition(flat, -K_eff)[-K_eff:]
+            triples = [(int(idx // E), int(idx % E), int(flat[idx])) for idx in top_idx]
+            triples.sort(key=lambda t: t[2], reverse=True)
+        out.append(triples)
+    return out
+
+
 def _draw_circle_grid_overview(
     counts: np.ndarray,
     total_tokens: int,
@@ -293,6 +372,9 @@ def _draw_circle_grid_overview(
     dpi: int = 120,
     colormap: str = DEFAULT_OVERVIEW_COLORMAP,
     quant: str = "",
+    adj: Optional[np.ndarray] = None,
+    top_k_pairs: int = DEFAULT_OVERVIEW_TOP_K_PAIRS,
+    line_scale: float = DEFAULT_OVERVIEW_LINE_SCALE,
 ) -> None:
     """Render the overview heatmap as a circle grid (mirrors routing_graph).
 
@@ -302,6 +384,13 @@ def _draw_circle_grid_overview(
     provided, a thick red ring is drawn around each top-K cell per layer
     (matching the highlight style used by the routing graph in
     ``eval-moe-mmlu/routing_graph_from_cpp.py``).
+
+    When ``adj`` is provided (shape ``[L-1, E, E]``), top-K adjacent-layer
+    co-activation pairs are drawn as lines connecting the two expert
+    circles, exactly like the routing graph. Line thickness is
+    proportional to the raw pair count (NOT normalised per layer pair),
+    so absolute volume is comparable across the whole figure. Pass
+    ``top_k_pairs=0`` to disable the lines.
 
     The figure axes are inverted so layer 0 sits at the top. Both axes
     are turned off; integer layer/expert tick labels are drawn manually
@@ -335,6 +424,34 @@ def _draw_circle_grid_overview(
         for e in range(E):
             pos[layer, e, 0] = e * col_spacing
             pos[layer, e, 1] = layer * row_spacing
+
+    # ---- co-activation lines (drawn FIRST so circles sit on top) ----
+    # Mirrors the routing graph in eval-moe-mmlu: top-K adjacent-layer
+    # pairs by raw count, line width proportional to raw count.
+    n_lines_drawn = 0
+    if adj is not None and L >= 2 and top_k_pairs > 0:
+        from matplotlib.lines import Line2D  # local import keeps header tidy
+        filtered = _filter_top_k_pairs(adj, top_k_pairs)
+        for layer in range(L - 1):
+            for (e_i, e_j, count) in filtered[layer]:
+                if count <= 0:
+                    continue
+                x1, y1 = pos[layer, e_i]
+                x2, y2 = pos[layer + 1, e_j]
+                lw = 0.1 + line_scale * count
+                # Alpha scales with rank-ish: high counts get more opaque.
+                alpha = min(0.85, 0.15 + 0.7 * math.tanh(count * line_scale * 5.0))
+                ax.add_line(
+                    Line2D(
+                        [x1, x2], [y1, y2],
+                        color=PAIR_LINE_COLOR,
+                        linewidth=lw,
+                        alpha=alpha,
+                        solid_capstyle="round",
+                        zorder=1,
+                    )
+                )
+                n_lines_drawn += 1
 
     # ---- expert circles: per-expert activation fill ----
     edge_color = "#bdbdbd"  # light grey border so zero-count circles are visible
@@ -420,11 +537,19 @@ def _draw_circle_grid_overview(
         if top_k_per_layer is not None
         else f"\nTop {top_k_count} experts per layer shown in the highlighted variant"
     )
+    lines_str = ""
+    if adj is not None and L >= 2 and top_k_pairs > 0:
+        lines_str = (
+            f"\nDark blue lines = top {top_k_pairs} adjacent-layer "
+            f"co-activations per layer pair ({n_lines_drawn:,} total)"
+        )
+    elif adj is not None and L >= 2 and top_k_pairs == 0:
+        lines_str = "\nAdjacent-layer co-activation lines disabled (--top-k-pairs 0)"
     ax.set_title(
         f"{model_id}{quant_str}  -  MoE expert activation counts "
         f"(top-{top_k} of {E})\n"
         f"aggregated across all datasets; {total_tokens:,} tokens"
-        f"{highlight_str}",
+        f"{highlight_str}{lines_str}",
         fontsize=11, pad=14,
     )
 
@@ -438,7 +563,11 @@ def save_overview_heatmap(counts: np.ndarray, total_tokens: int,
                           model_id: str, arch: dict[str, Any],
                           top_k: int, top_k_count: int,
                           path: Path, *, dpi: int = 120,
-                          quant: str = "") -> None:
+                          quant: str = "",
+                          adj: Optional[np.ndarray] = None,
+                          top_k_pairs: int = DEFAULT_OVERVIEW_TOP_K_PAIRS,
+                          line_scale: float = DEFAULT_OVERVIEW_LINE_SCALE,
+                          ) -> None:
     """Overview heatmap: L x E circle grid, blue gradient, linear scale.
 
     Visual style mirrors the routing graph in
@@ -446,11 +575,16 @@ def save_overview_heatmap(counts: np.ndarray, total_tokens: int,
     a decoupled grid, circle fill linearly scaled to the **raw** activation
     count (no per-token normalisation). No highlight rings here — see
     ``save_highlighted_heatmap`` for the top-K variant.
+
+    When ``adj`` (shape ``[L-1, E, E]``) is provided, the top
+    ``top_k_pairs`` adjacent-layer co-activation pairs are drawn as dark
+    blue lines (line thickness proportional to raw count, same contract
+    as the routing graph). Pass ``top_k_pairs=0`` to disable the lines.
     """
     _draw_circle_grid_overview(
         counts, total_tokens, model_id, arch, top_k, top_k_count,
         top_k_per_layer=None, path=path, dpi=dpi,
-        quant=quant,
+        quant=quant, adj=adj, top_k_pairs=top_k_pairs, line_scale=line_scale,
     )
 
 
@@ -459,18 +593,26 @@ def save_highlighted_heatmap(counts: np.ndarray, total_tokens: int,
                               top_k: int, top_k_count: int,
                               top_k_per_layer: list[list[dict[str, Any]]],
                               path: Path, *, dpi: int = 120,
-                              quant: str = "") -> None:
+                              quant: str = "",
+                              adj: Optional[np.ndarray] = None,
+                              top_k_pairs: int = DEFAULT_OVERVIEW_TOP_K_PAIRS,
+                              line_scale: float = DEFAULT_OVERVIEW_LINE_SCALE,
+                              ) -> None:
     """Same overview heatmap with red rings around top-K cells per layer.
 
     Identical to ``save_overview_heatmap`` except that each top-K cell
-    (per layer) is overlaid with a thick red ring. The ring style
-    (colour, width) matches the highlight ring used by the routing graph
-    in ``eval-moe-mmlu/routing_graph_from_cpp.py``.
+    (per layer) is overlaid with a thin red ring. The ring colour matches
+    the highlight ring used by the routing graph in
+    ``eval-moe-mmlu/routing_graph_from_cpp.py`` (width is reduced here
+    so the ring does not visually dominate the smaller overview circles).
+
+    When ``adj`` is provided, top-K adjacent-layer co-activation lines
+    are drawn just like in the un-highlighted overview variant.
     """
     _draw_circle_grid_overview(
         counts, total_tokens, model_id, arch, top_k, top_k_count,
         top_k_per_layer=top_k_per_layer, path=path, dpi=dpi,
-        quant=quant,
+        quant=quant, adj=adj, top_k_pairs=top_k_pairs, line_scale=line_scale,
     )
 
 
@@ -547,10 +689,18 @@ def save_top_k_bar_chart(counts: np.ndarray,
 def process_model(model_dir: Path, json_paths: list[Path],
                   output_dir: Path, top_k_fraction: float,
                   include_per_dataset: bool, *, dpi: int,
-                  quant: str = "") -> dict[str, Any]:
+                  quant: str = "",
+                  top_k_pairs: int = DEFAULT_OVERVIEW_TOP_K_PAIRS,
+                  line_scale: float = DEFAULT_OVERVIEW_LINE_SCALE,
+                  ) -> dict[str, Any]:
     """Aggregate one (model, quant) cell's datasets and write the overview artifacts.
 
     Returns a summary dict for stdout reporting.
+
+    ``top_k_pairs`` and ``line_scale`` control the adjacent-layer
+    co-activation lines drawn on both overview heatmaps (mirroring the
+    routing graph in ``eval-moe-mmlu``). Pass ``top_k_pairs=0`` to
+    disable the lines.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -560,6 +710,9 @@ def process_model(model_dir: Path, json_paths: list[Path],
     model_id: str | None = None
     arch: dict[str, Any] | None = None
     counts_total = None
+    adj_total: np.ndarray | None = None
+    n_datasets_with_agg = 0
+    n_datasets_missing_agg = 0
     total_tokens = 0
     n_datasets_used = 0
     n_datasets_skipped = 0
@@ -593,6 +746,29 @@ def process_model(model_dir: Path, json_paths: list[Path],
                 n_datasets_skipped += 1
                 continue
             counts_total += loaded["counts_total"]
+
+        # Aggregate the adjacent-layer pair counts when present. Datasets
+        # without the aggregate block (older binaries) are tolerated; we
+        # only draw the overview lines when ALL used datasets have it.
+        if loaded["has_aggregate"]:
+            if adj_total is None:
+                adj_total = loaded["adj"].astype(np.int64).copy()
+            else:
+                if loaded["adj"].shape != adj_total.shape:
+                    print(
+                        f"[warn] {jp}: adj shape {loaded['adj'].shape} "
+                        f"!= expected {adj_total.shape}; "
+                        f"skipping its pair-count contribution"
+                    )
+                else:
+                    adj_total += loaded["adj"]
+            n_datasets_with_agg += 1
+        else:
+            n_datasets_missing_agg += 1
+            print(
+                f"[note] {jp.parent.name}: no `aggregate` block; "
+                f"its pair counts will NOT contribute to the overview lines"
+            )
 
         per_dataset_counts[ds_name] = loaded["counts_total"]
         per_dataset_meta.append(loaded["per_dataset_meta"])
@@ -641,19 +817,23 @@ def process_model(model_dir: Path, json_paths: list[Path],
             )
 
     # ----------------------------------------------------------------- persist
-    # 1. Overview heatmap (circle grid, blue gradient, linear raw counts).
+    # 1. Overview heatmap (circle grid, blue gradient, linear raw counts,
+    #    plus top-K adjacent-layer co-activation lines when available).
     p = output_dir / "routing_heatmap_overview.png"
     save_overview_heatmap(
         counts_total, total_tokens, model_id or model_dir.name, arch,
         top_k, top_k_count, p, dpi=dpi, quant=quant,
+        adj=adj_total, top_k_pairs=top_k_pairs, line_scale=line_scale,
     )
     print(f"[save] {p}")
 
-    # 2. Highlighted heatmap (same circle grid + red rings on top-K per layer).
+    # 2. Highlighted heatmap (same circle grid + red rings on top-K per layer
+    #    + the same co-activation lines).
     p = output_dir / "routing_heatmap_overview_highlighted.png"
     save_highlighted_heatmap(
         counts_total, total_tokens, model_id or model_dir.name, arch,
         top_k, top_k_count, top_k_per_layer, p, dpi=dpi, quant=quant,
+        adj=adj_total, top_k_pairs=top_k_pairs, line_scale=line_scale,
     )
     print(f"[save] {p}")
 
@@ -701,16 +881,25 @@ def process_model(model_dir: Path, json_paths: list[Path],
         json.dump(top_experts_payload, f, indent=2)
     print(f"[save] {p}")
 
-    # 5. counts_total_overview.json (raw aggregated LxE)
+    # 5. counts_total_overview.json (raw aggregated LxE + aggregated adj
+    #    pair counts, when available). The adjacent pair-counts are
+    #    persisted as a separate `adjacent_pair_counts` key with shape
+    #    documented by the `shape` field of the same name, so downstream
+    #    tools (and the routing-graph viewer) can consume them directly.
     p = output_dir / "counts_total_overview.json"
+    payload: dict[str, Any] = {
+        "model": model_id,
+        "model_arch": arch,
+        "totals_tokens": int(total_tokens),
+        "shape": [int(L), int(E)],
+        "counts_total": counts_total.tolist(),
+    }
+    if adj_total is not None:
+        payload["adjacent_pair_counts"] = adj_total.tolist()
+        payload["adjacent_pair_counts_shape"] = list(adj_total.shape)
+        payload["adjacent_pair_counts_total"] = int(adj_total.sum())
     with open(p, "w") as f:
-        json.dump({
-            "model": model_id,
-            "model_arch": arch,
-            "totals_tokens": int(total_tokens),
-            "shape": [int(L), int(E)],
-            "counts_total": counts_total.tolist(),
-        }, f)
+        json.dump(payload, f)
     print(f"[save] {p}")
 
     # 6. metadata_overview.json
@@ -731,6 +920,12 @@ def process_model(model_dir: Path, json_paths: list[Path],
             "datasets_skipped": n_datasets_skipped,
             "tokens_total": int(total_tokens),
             "questions_total": int(n_questions_total),
+            "datasets_with_aggregate": n_datasets_with_agg,
+            "datasets_missing_aggregate": n_datasets_missing_agg,
+        },
+        "coactivation_lines": {
+            "top_k_pairs": int(top_k_pairs),
+            "line_scale": float(line_scale),
         },
     }
     with open(p, "w") as f:
@@ -782,6 +977,24 @@ def main() -> int:
     )
     parser.add_argument("--dpi", type=int, default=120,
                         help="Output PNG DPI.")
+    parser.add_argument(
+        "--top-k-pairs", type=int, default=DEFAULT_OVERVIEW_TOP_K_PAIRS,
+        help=(
+            "top-K adjacent-layer co-activation pairs to draw on the overview "
+            "heatmaps (same role as --top-k in eval-moe-mmlu/routing_graph). "
+            "Set to 0 to disable the cross-layer lines entirely. "
+            f"(default: {DEFAULT_OVERVIEW_TOP_K_PAIRS})"
+        ),
+    )
+    parser.add_argument(
+        "--line-scale", type=float, default=DEFAULT_OVERVIEW_LINE_SCALE,
+        help=(
+            "line width = 0.1 + line_scale * raw_count for the cross-layer "
+            "co-activation lines. Tune to match the magnitude of your pair "
+            f"counts (default: {DEFAULT_OVERVIEW_LINE_SCALE:.0e}, matches "
+            "eval-moe-mmlu/routing_graph_from_cpp.py)."
+        ),
+    )
     args = parser.parse_args()
 
     results_dir: Path = args.results_dir
@@ -820,6 +1033,8 @@ def main() -> int:
             top_k_fraction=args.top_k_fraction,
             include_per_dataset=args.include_per_dataset,
             dpi=args.dpi, quant=quant,
+            top_k_pairs=args.top_k_pairs,
+            line_scale=args.line_scale,
         )
         summaries.append(summary)
 

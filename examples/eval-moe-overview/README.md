@@ -31,14 +31,14 @@ For each `(model, quant)` cell the script writes
 `<results-dir>/<model>/<quant>/overall/` (or
 `<results-dir>/<model>/overall/` for legacy cells):
 
-| File                                       | Description                                                                                                                                                                                                       |
-| ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `routing_heatmap_overview.png`             | L × E circle grid, one circle per expert. Circle fill is the **raw** activation count (linear scale, Blues colormap). Layer 0 is at the top; circle fill darker = more activity.                                  |
-| `routing_heatmap_overview_highlighted.png` | Same circle grid as the overview, with a thin **red ring** (matching the routing-graph ring colour in `eval-moe-mmlu/routing_graph_from_cpp.py`) around the top `⌈n_expert × --top-k-fraction` experts per layer. |
-| `top_experts_bars.png`                     | One panel per layer: top-K activation counts (descending, fractions of layer total).                                                                                                                              |
-| `top_experts.json`                         | Per-layer top-K list with `expert_id`, `rank`, `count`, `fraction_of_layer_total`, `cumulative_share`. Optionally includes `per_dataset_layer_topk` when `--include-per-dataset` is passed.                       |
-| `counts_total_overview.json`               | Raw aggregated L×E matrix (sum of raw counts, not normalized).                                                                                                                                                    |
-| `metadata_overview.json`                   | Model id, arch, quant, per-dataset token split, total tokens, generation timestamp.                                                                                                                               |
+| File                                       | Description                                                                                                                                                                                                                                                                                                                                               |
+| ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `routing_heatmap_overview.png`             | L × E circle grid, one circle per expert. Circle fill is the **raw** activation count (linear scale, Blues colormap). Layer 0 is at the top; circle fill darker = more activity. **Dark-blue lines** connect the top `--top-k-pairs` adjacent-layer expert co-activations (line thickness proportional to raw count, same contract as the routing graph). |
+| `routing_heatmap_overview_highlighted.png` | Same circle grid as the overview, with a thin **red ring** (matching the routing-graph ring colour in `eval-moe-mmlu/routing_graph_from_cpp.py`) around the top `⌈n_expert × --top-k-fraction` experts per layer. Includes the same co-activation lines.                                                                                                  |
+| `top_experts_bars.png`                     | One panel per layer: top-K activation counts (descending, fractions of layer total).                                                                                                                                                                                                                                                                      |
+| `top_experts.json`                         | Per-layer top-K list with `expert_id`, `rank`, `count`, `fraction_of_layer_total`, `cumulative_share`. Optionally includes `per_dataset_layer_topk` when `--include-per-dataset` is passed.                                                                                                                                                               |
+| `counts_total_overview.json`               | Raw aggregated L×E matrix (sum of raw counts, not normalized). When the per-dataset JSONs include the `aggregate` block, the aggregated `[L-1, E, E] int64` `adjacent_pair_counts` array is also persisted here under the same key, with a `adjacent_pair_counts_shape` header.                                                                           |
+| `metadata_overview.json`                   | Model id, arch, quant, per-dataset token split, total tokens, generation timestamp, and a `coactivation_lines` block documenting the `--top-k-pairs` / `--line-scale` values that produced the PNG.                                                                                                                                                       |
 
 ## Aggregation
 
@@ -70,6 +70,17 @@ graph's highlight ring in `eval-moe-mmlu/routing_graph_from_cpp.py`;
 the width is intentionally thinner (the routing graph uses 4.0) so
 the ring does not visually dominate the smaller overview circles.
 
+Both variants also draw **dark-blue lines** (`#1f3a93`, same colour
+as the routing graph) connecting the top `--top-k-pairs`
+adjacent-layer `(L, e_i) -> (L+1, e_j)` co-activations, sorted by
+raw count desc per layer pair. Line thickness is `0.1 + line_scale *
+raw_count` (default `line_scale = 5e-7`, same default as the routing
+graph). The aggregated pair counts are summed across datasets from
+the per-dataset `aggregate.adjacent_pair_counts` block; if any
+dataset lacks that block its contribution is skipped with a `[note]`
+on stdout and the title reports how many datasets contributed. Set
+`--top-k-pairs 0` to disable the lines.
+
 A vertical colorbar on the right encodes the raw count scale, with
 tick labels formatted in K/M (`37.2M`, `450.0K`, etc.) by the same
 millions-formatter helper used by the routing graph.
@@ -96,14 +107,16 @@ python examples/eval-moe-overview/aggregate_overview.py --results-dir build/resu
 
 Flags:
 
-| Flag                    | Meaning                                                           | Default         |
-| ----------------------- | ----------------------------------------------------------------- | --------------- |
-| `--results-dir`         | Root directory containing per-model subdirectories                | `build/results` |
-| `--top-k-fraction`      | Fraction of experts per layer to highlight / report as top-K      | `0.125`         |
-| `--include-per-dataset` | Add `per_dataset_layer_topk` to `top_experts.json`                | off             |
-| `--models`              | Restrict to a subset of model directory names (repeatable)        | (all)           |
-| `--quants`              | Restrict to a subset of quantization directory names (repeatable) | (all)           |
-| `--dpi`                 | Output PNG DPI                                                    | `120`           |
+| Flag                    | Meaning                                                             | Default         |
+| ----------------------- | ------------------------------------------------------------------- | --------------- |
+| `--results-dir`         | Root directory containing per-model subdirectories                  | `build/results` |
+| `--top-k-fraction`      | Fraction of experts per layer to highlight / report as top-K        | `0.125`         |
+| `--top-k-pairs`         | Top-K adjacent-layer co-activation pairs to draw on both heatmaps   | `64`            |
+| `--line-scale`          | `line_width = 0.1 + line_scale * raw_count` for co-activation lines | `5e-7`          |
+| `--include-per-dataset` | Add `per_dataset_layer_topk` to `top_experts.json`                  | off             |
+| `--models`              | Restrict to a subset of model directory names (repeatable)          | (all)           |
+| `--quants`              | Restrict to a subset of quantization directory names (repeatable)   | (all)           |
+| `--dpi`                 | Output PNG DPI                                                      | `120`           |
 
 The `--colormap` flag was removed when the overview heatmap was switched
 to the Blues circle-grid style (matching the routing graph). The new

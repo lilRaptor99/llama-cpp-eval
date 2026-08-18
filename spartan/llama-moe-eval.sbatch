@@ -110,11 +110,11 @@
 
 # ---------------------------------------------------------------- SLURM
 #SBATCH --job-name=llama-moe-eval
-#SBATCH --partition=gpu-a100
+#SBATCH --partition=gpu-a100-short
 #SBATCH --gres=gpu:2
-#SBATCH --cpus-per-task=24
-#SBATCH --mem=128G
-#SBATCH --time=0-06:00:00
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=120G
+#SBATCH --time=0-03:55:00
 #SBATCH --output=spartan/logs/llama-moe-eval-%j.out
 #SBATCH --error=spartan/logs/llama-moe-eval-%j.err
 #SBATCH --mail-type=ALL
@@ -177,7 +177,47 @@ mkdir -p "${BUILD_DIR}" "${DATASETS_DIR}" "${RESULTS_DIR}" "${HF_CACHE}"
 : "${MODELS_OVERRIDE:=}"        # empty = run all 4 hardcoded models
 : "${DATASETS_OVERRIDE:=}"      # empty = run all 5 datasets
 : "${QUANTS_OVERRIDE:=Q4_K_M}"  # default quant
-: "${EXTRA_CMAKE_FLAGS:=}"
+# Build-time workarounds:
+#   -DLLAMA_OPENSSL=ON            silences the "HTTPS is not supported"
+#                                 warning from common/hf-cache.cpp (the HF
+#                                 resolver). Cheap; needed on every
+#                                 rebuild anyway because the upstream
+#                                 default is ON and a stray -U flag
+#                                 during cmake configure silently turns
+#                                 it OFF.
+#   -DGGML_CUDA_NO_PEER_COPY=ON   disables peer-copy kernels between the
+#                                 2 A100 GPUs. Peer-copy OOB is one of
+#                                 the more common triggers of the
+#                                 "illegal memory access" stack above,
+#                                 and on PCIe the cost is small
+#                                 (~32 GB/s peer BW). On NVLink we
+#                                 leave the peer-copy path enabled
+#                                 because the bandwidth (~600 GB/s on
+#                                 A100 NVLink3) makes tensor parallel
+#                                 (--split-mode=row) actually fast.
+# Defaults applied only when EXTRA_CMAKE_FLAGS is otherwise unset, so
+# user-supplied flags still win. We probe the GPU topology at job
+# start with `nvidia-smi topo -m` and drop NO_PEER_COPY automatically
+# when the GPUs are connected by NVLink (not PIX/PCIe).
+if [[ -z "${EXTRA_CMAKE_FLAGS:-}" ]]; then
+    _has_nvlink=0
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        # nvidia-smi topo -m prints a matrix where GPU<->GPU rows show
+        # "NVLink" (connected) or "PIX" / "SYS" (not). We look for at
+        # least one NVLink entry.
+        if nvidia-smi topo -m 2>/dev/null | grep -q NVLink; then
+            _has_nvlink=1
+        fi
+    fi
+    if [[ "${_has_nvlink}" -eq 1 ]]; then
+        echo "[info] nvidia-smi topo -m reports NVLink between GPUs; leaving peer-copy enabled"
+        EXTRA_CMAKE_FLAGS="-DLLAMA_OPENSSL=ON"
+    else
+        echo "[info] nvidia-smi topo -m reports no NVLink; adding -DGGML_CUDA_NO_PEER_COPY=ON"
+        EXTRA_CMAKE_FLAGS="-DLLAMA_OPENSSL=ON -DGGML_CUDA_NO_PEER_COPY=ON"
+    fi
+    unset _has_nvlink
+fi
 : "${ROUTING_GRAPH_LINE_SCALE:=}" # empty = use routing_graph_from_cpp.py default (5e-7)
 # NUMA + GPU-offload knobs. See the env-var table at the top of this
 # file for rationale; the short version is:
@@ -352,6 +392,16 @@ export HUGGINGFACE_HUB_CACHE="${HF_CACHE}"
 export GGML_CUDA_ENABLE_UNIFIED_MEMORY="${GGML_CUDA_ENABLE_UNIFIED_MEMORY:-1}"
 # NB: -ngl 99 is set by run-evaluator.sh's run_eval() and offloads every
 #     layer to GPU. We do not override that here.
+
+# CUDA-graph workaround for the "illegal memory access" stack seen on
+# OLMoE/include + deepseek-moe-16b/include (rc=134, aborted in
+# ggml_backend_cuda_synchronize after llama_decode). The fault is in a
+# captured MoE matmul kernel; turning CUDA graphs off bypasses the
+# capture+replay path that surfaces the async error. Wired in
+# ggml-cuda/common.cuh:1234 (`disable_cuda_graphs_due_to_env`). Costs
+# ~5-15% first-token latency but is safe. Default 1 (workaround on);
+# set GGML_CUDA_DISABLE_GRAPHS=0 to opt out.
+export GGML_CUDA_DISABLE_GRAPHS="${GGML_CUDA_DISABLE_GRAPHS:-1}"
 
 # Compiler-visible CMAKE_ARCHS for the build phase.
 export CUDA_ARCHITECTURES

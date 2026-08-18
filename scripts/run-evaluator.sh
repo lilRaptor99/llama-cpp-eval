@@ -346,6 +346,28 @@ ensure_build() {
             fi
         done
     fi
+
+    # Source-vs-binary staleness check. cmake's incremental build uses
+    # mtime comparisons, but those only work within a single build tree.
+    # If BUILD_DIR was previously populated from a different checkout
+    # (e.g. a different $REPO_ROOT, or sources were edited and pushed
+    # without a corresponding rebuild), the existing binary will be
+    # newer than the source but still be the old code. Detect this by
+    # comparing the source mtime against the binary mtime and force a
+    # rebuild if any binary is older than its source.
+    if [[ $need_rebuild -eq 0 ]]; then
+        for ds in "${DATASETS[@]}"; do
+            local bin bin_src
+            bin="$(binary_for "$ds")"
+            bin_src="${REPO_ROOT}/examples/eval-moe-${ds}/eval-moe-${ds}.cpp"
+            if [[ -x "${bin}" && -f "${bin_src}" ]]; then
+                if [[ "${bin_src}" -nt "${bin}" ]]; then
+                    _log_info "source ${bin_src} is newer than ${bin##*/} - forcing rebuild"
+                    need_rebuild=1; break
+                fi
+            fi
+        done
+    fi
     if [[ $need_rebuild -eq 1 ]]; then
         # Compose cmake configure flags. We always set CMAKE_BUILD_TYPE;
         # when --cuda is on we add -DGGML_CUDA=ON (and an optional

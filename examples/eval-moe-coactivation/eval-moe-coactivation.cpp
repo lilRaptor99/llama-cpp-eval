@@ -913,6 +913,12 @@ int main(int argc, char ** argv) {
         if (a == "--per-subject-inter") {
             continue;
         }
+        // --embeddings / --no-embeddings are no-arg boolean toggles
+        // consumed by the first pass; drop them from the argv that
+        // common_params_parse sees (which doesn't know about them).
+        if (a == "--embeddings" || a == "--no-embeddings") {
+            continue;
+        }
         filtered.push_back(argv[i]);
     }
 

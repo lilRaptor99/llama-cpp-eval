@@ -233,6 +233,15 @@ fi
 : "${SPLIT_MODE:=layer}"
 : "${NGPUS:=2}"     # mirrors --gres=gpu:2 above; update both together.
 : "${EXTRA_TENSOR_SPLIT:=}"  # empty = auto-derive uniform split for NGPUS
+# REBUILD=1 forces a clean rebuild of the 5 eval binaries even if they
+# already exist. Needed when EXTRA_CMAKE_FLAGS changes a compile-time
+# -D flag (e.g. GGML_CUDA_NO_PEER_COPY, GGML_CUDA_FORCE_MMQ, LLAMA_OPENSSL)
+# because ensure_build() only rebuilds when binaries are MISSING - it
+# does not compare cmake flags. Default 0 (reuse the existing build).
+# Switching between PCIe and NVLink builds requires REBUILD=1 because
+# -DGGML_CUDA_NO_PEER_COPY is gated by #ifdef and the topology-driven
+# probe flips it between submissions.
+: "${REBUILD:=0}"
 : "${SKIP_PYTHON_PLOTS:=1}"     # 1 = skip ALL python post-processing (plots,
                                  #     routing graphs, jaccard sweep);
                                  # 0 = run all of them. Default 1 because
@@ -267,6 +276,7 @@ echo "[$(date -Iseconds)] SPLIT_MODE        = ${SPLIT_MODE}"
 echo "[$(date -Iseconds)] NGPUS             = ${NGPUS}"
 echo "[$(date -Iseconds)] EXTRA_TENSOR_SPLIT= ${EXTRA_TENSOR_SPLIT:-auto (${NGPUS}-way uniform)}"
 echo "[$(date -Iseconds)] SKIP_PYTHON_PLOTS = ${SKIP_PYTHON_PLOTS}"
+echo "[$(date -Iseconds)] REBUILD            = ${REBUILD}"
 echo "============================================================"
 
 # ---------------------------------------------------------------- modules
@@ -527,6 +537,9 @@ if [[ -n "${MODELS_OVERRIDE}" ]]; then
     # Bash word-split on purpose: the env var is a space-separated list.
     # shellcheck disable=SC2206
     RUN_ARGS+=( --models ${MODELS_OVERRIDE} )
+fi
+if [[ "${REBUILD:-0}" -eq 1 ]]; then
+    RUN_ARGS+=( --rebuild )
 fi
 if [[ -n "${DATASETS_OVERRIDE}" ]]; then
     # shellcheck disable=SC2206

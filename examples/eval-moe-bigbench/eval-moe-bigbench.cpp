@@ -47,6 +47,13 @@
 
 // Number of test questions to run per BBH task config.
 static constexpr int QUESTIONS_PER_TASK = 50;
+// Default for params.embedding. True reproduces the pre-patch behaviour
+// (and is needed when the downstream tool reads logits directly); false
+// captures routing-only via cb_eval without forcing output_all=true. See
+// the comment at params.embedding below for why false is the safer
+// default against the CUDA illegal-memory-access bug. Overridable via
+// the --embeddings / --no-embeddings CLI flag.
+static bool          g_embeddings_mode  = false;
 
 // Number of generation tokens after prefill. Set to 0 to disable generation
 // entirely (prompt-only mode, useful for control experiments).
@@ -644,6 +651,10 @@ int main(int argc, char ** argv) {
             gen_tokens = std::stoi(next("N"));
         } else if (a == "-o" || a == "--output") {
             output_path = next("path");
+        } else if (a == "--embeddings") {
+            g_embeddings_mode = true;
+        } else if (a == "--no-embeddings") {
+            g_embeddings_mode = false;
         }
     }
 
@@ -715,10 +726,20 @@ int main(int argc, char ** argv) {
     // output_all=true on every llama_decode, so the prefill routes all
     // tokens through every MoE layer (without this only the last position
     // flows through MoE because inp_out_ids has size 1).
+    //
+    // NB: the cb_eval hook fires for every ffn_moe_topk-<il> tensor in the
+    // compute graph regardless of params.embedding. Setting embedding=true
+    // is therefore NOT required to capture routing counts - it only
+    // affects whether the OUTPUT tensor is materialised. On long
+    // multilingual prefills (e.g. Greek/INCLUDE questions), embedding=true
+    // triggers a CUDA "illegal memory access" in the MoE routing kernel
+    // (observed on A100 PCIe + A100 NVLink, both llama.cpp master and
+    // e5df8bfb8). Default embedding=false (set --embeddings to opt back
+    // in to the old behaviour for A/B testing).
     params.cb_eval           = moe_eval_callback;
     params.cb_eval_user_data = &g_acc;
     params.warmup            = false;
-    params.embedding         = true;
+    params.embedding         = g_embeddings_mode;
 
     auto   init_result = common_init_from_params(params);
     auto * model       = init_result->model();

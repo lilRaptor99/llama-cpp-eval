@@ -60,7 +60,10 @@ static constexpr int N_SHOT = 5;
 // template EOS; 4 tokens covers that with a small safety margin. Set to 0 to
 // disable generation entirely (prompt-only mode, useful for control
 // experiments and back-compat with the eval-moe-mmlu harness).
-static constexpr int GEN_TOKENS = 4;
+static constexpr int GEN_TOKENS        = 4;
+// Default for params.embedding. See comment at params.embedding below.
+// Overridable via --embeddings / --no-embeddings CLI flag.
+static bool          g_embeddings_mode = false;
 
 // Default inter-layer output mode. 0 = full upper-triangular [L, L, E, E]
 // (back-compat); K>0 = only k=1..K off-diagonals, output as [L, K, E, E]
@@ -885,6 +888,10 @@ int main(int argc, char ** argv) {
             sparse_min_count = std::stoi(next("N"));
         } else if (a == "-o" || a == "--output") {
             output_path = next("path");
+        } else if (a == "--embeddings") {
+            g_embeddings_mode = true;
+        } else if (a == "--no-embeddings") {
+            g_embeddings_mode = false;
         }
     }
 
@@ -957,9 +964,17 @@ int main(int argc, char ** argv) {
     params.warmup            = false;
 
     // Force `cparams.embeddings = true` -> `output_all = true` in llama_decode
-    // so every token is routed (not just the last). Mirrors the trick in
-    // eval-moe-mmlu.cpp.
-    params.embedding = true;
+    //
+    // NB: the cb_eval hook fires for every ffn_moe_topk-<il> tensor in the
+    // compute graph regardless of params.embedding. Setting embedding=true
+    // is therefore NOT required to capture routing counts - it only affects
+    // whether the OUTPUT tensor is materialised. On long multilingual
+    // prefills (e.g. Greek/INCLUDE questions), embedding=true triggers a
+    // CUDA "illegal memory access" in the MoE routing kernel (observed on
+    // A100 PCIe + A100 NVLink, both llama.cpp master and e5df8bfb8).
+    // Default embedding=false (set --embeddings to opt back in to the old
+    // behaviour for A/B testing).
+    params.embedding = g_embeddings_mode;
 
     auto   init_result = common_init_from_params(params);
     auto * model       = init_result->model();

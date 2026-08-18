@@ -80,6 +80,12 @@ NUMA_MODE="${NUMA_MODE:-isolate}"
 NGL="${NGL:-99}"
 SPLIT_MODE="${SPLIT_MODE:-layer}"
 EXTRA_TENSOR_SPLIT="${EXTRA_TENSOR_SPLIT:-}"
+# EMBD: forwarded as --embeddings / --no-embeddings to the eval binaries.
+# Default 0 (no embeddings) to avoid the CUDA illegal-memory-access bug
+# we hit with embedding=true on long multilingual prefills; the cb_eval
+# hook still captures routing data either way. Set EMBD=1 to opt back
+# into the old behaviour for A/B testing.
+EMBD="${EMBD:-0}"
 
 declare -A STATUS=()
 
@@ -230,6 +236,13 @@ Options:
                                   (default: empty; e.g. "50,50" for 2 GPUs)
   --cuda                        enable CUDA build (passes -DGGML_CUDA=ON to cmake)
   --no-cuda                     disable CUDA build (default)
+  --embeddings                  pass --embeddings to each eval binary
+                                (forces cparams.embeddings=true; default off
+                                because embedding=true triggers a CUDA
+                                illegal-memory-access bug on long multilingual
+                                prefills. The cb_eval hook still captures
+                                routing counts either way)
+  --no-embeddings               opposite of --embeddings (default)
   -h, --help                    show this message and exit
 
 Environment:
@@ -241,6 +254,10 @@ Environment:
   NGL=<int>                      equivalent to --ngl <int>
   SPLIT_MODE=<mode>              equivalent to --split-mode <mode>
   EXTRA_TENSOR_SPLIT=<a,b,...>   equivalent to --tensor-split <a,b,...>
+  EMBD=<0|1>                    equivalent to --embeddings/--no-embeddings
+                                 (default 0 = no embeddings; the safer mode
+                                 that avoids the CUDA OOB bug on long
+                                 multilingual prefills)
 
 The hardcoded MODELS list is at the top of the script (DEFAULT_MODELS).
 The default quantization is Q4_K_M (see QUANTS= at the top of the script).
@@ -292,6 +309,8 @@ parse_args() {
             --ngl)              NGL="$2"; shift 2 ;;
             --split-mode)       SPLIT_MODE="$2"; shift 2 ;;
             --tensor-split)     EXTRA_TENSOR_SPLIT="$2"; shift 2 ;;
+            --embeddings)       EMBD=1; shift ;;
+            --no-embeddings)    EMBD=0; shift ;;
             --cuda)             USE_CUDA=1; shift ;;
             --no-cuda)          USE_CUDA=0; shift ;;
             -h|--help)          PRINT_USAGE=1; shift ;;
@@ -519,6 +538,17 @@ run_eval() {
         BIN_FLAGS+=( --tensor-split "50,50" )
     fi
 
+    # Embedding mode toggle. Default off (no embeddings, --no-embeddings
+    # to the eval binary) to avoid the CUDA illegal-memory-access bug on
+    # long multilingual prefills; the cb_eval hook still captures routing
+    # counts regardless. See examples/eval-moe-*/eval-moe-*.cpp for the
+    # per-binary rationale.
+    if [[ "${EMBD}" -eq 1 ]]; then
+        BIN_FLAGS+=( --embeddings )
+    else
+        BIN_FLAGS+=( --no-embeddings )
+    fi
+
     if "${binary}" "${BIN_FLAGS[@]}" \
             "${CF_FLAGS[@]}" "${DS_FLAGS[@]}" \
             -o "$json" \
@@ -623,7 +653,7 @@ main() {
     _log_info "MODELS (${#MODELS[@]})       = ${MODELS[*]}"
     _log_info "DATASETS (${#DATASETS[@]})     = ${DATASETS[*]}"
     _log_info "QUANTS (${#QUANTS[@]})       = ${QUANTS[*]}"
-    _log_info "REBUILD=${REBUILD}, REDOWNLOAD=${REDOWNLOAD}, SKIP_PLOTS=${SKIP_PLOTS}, SKIP_ROUTING_GRAPHS=${SKIP_ROUTING_GRAPHS}, USE_CUDA=${USE_CUDA}, ROUTING_GRAPH_LINE_SCALE=${LINE_SCALE:-<default 5e-7>}, NUMA_MODE=${NUMA_MODE}, NGL=${NGL}, SPLIT_MODE=${SPLIT_MODE}, EXTRA_TENSOR_SPLIT=${EXTRA_TENSOR_SPLIT:-<unset>}"
+    _log_info "REBUILD=${REBUILD}, REDOWNLOAD=${REDOWNLOAD}, SKIP_PLOTS=${SKIP_PLOTS}, SKIP_ROUTING_GRAPHS=${SKIP_ROUTING_GRAPHS}, USE_CUDA=${USE_CUDA}, ROUTING_GRAPH_LINE_SCALE=${LINE_SCALE:-<default 5e-7>}, NUMA_MODE=${NUMA_MODE}, NGL=${NGL}, SPLIT_MODE=${SPLIT_MODE}, EXTRA_TENSOR_SPLIT=${EXTRA_TENSOR_SPLIT:-<unset>}, EMBD=${EMBD}"
     echo "============================================================"
 
     echo "============================================================"

@@ -39,7 +39,10 @@ static constexpr int QUERIES_PER_SUBJECT = 50;
 
 // Number of few-shot exemplars drawn from each subject's dev split. The OLMoE
 // authors evaluate MMLU 5-shot in their published numbers.
-static constexpr int N_SHOT = 5;
+static constexpr int N_SHOT            = 5;
+// Default for params.embedding. See comment at params.embedding below.
+// Overridable via --embeddings / --no-embeddings CLI flag.
+static bool          g_embeddings_mode = false;
 
 // ------------------------------------------------------------------- globals
 
@@ -605,6 +608,10 @@ int main(int argc, char ** argv) {
             n_shot = std::stoi(next("N"));
         } else if (a == "-o" || a == "--output") {
             output_path = next("path");
+        } else if (a == "--embeddings") {
+            g_embeddings_mode = true;
+        } else if (a == "--no-embeddings") {
+            g_embeddings_mode = false;
         }
     }
 
@@ -681,7 +688,16 @@ int main(int argc, char ** argv) {
     // olmoe.cpp) only routes that single token. OLMoE is a generative model,
     // not an embedding model, but `embedding` is just a flag here - it doesn't
     // change the graph topology beyond flipping `output_all`.
-    params.embedding = true;
+    //
+    // NB: the cb_eval hook fires for every ffn_moe_topk-<il> tensor in the
+    // compute graph regardless of params.embedding. Setting embedding=true is
+    // therefore NOT required to capture routing counts - it only affects whether
+    // the OUTPUT tensor is materialised. On long multilingual prefills (e.g.
+    // Greek/INCLUDE questions), embedding=true triggers a CUDA "illegal memory
+    // access" in the MoE routing kernel (observed on A100 PCIe + A100 NVLink,
+    // both llama.cpp master and e5df8bfb8). Default embedding=false (set
+    // --embeddings to opt back in to the old behaviour for A/B testing).
+    params.embedding = g_embeddings_mode;
 
     auto   init_result = common_init_from_params(params);
     auto * model       = init_result->model();

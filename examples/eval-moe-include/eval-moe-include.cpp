@@ -71,7 +71,10 @@ static constexpr int N_SHOT = 5;
 // entirely (prompt-only mode, useful for control experiments). The default
 // of 16 mirrors eval-moe-popqa and is enough headroom for the chosen letter
 // plus a small amount of reasoning / trailing prose.
-static constexpr int GEN_TOKENS = 16;
+static constexpr int GEN_TOKENS        = 16;
+// Default for params.embedding. See comment at params.embedding below.
+// Overridable via --embeddings / --no-embeddings CLI flag.
+static bool          g_embeddings_mode = false;
 
 // Default sampling: greedy, deterministic. Matches the canonical self-rag
 // / Harness evaluation protocol.
@@ -811,6 +814,10 @@ int main(int argc, char ** argv) {
             gen_tokens = std::stoi(next("N"));
         } else if (a == "-o" || a == "--output") {
             output_path = next("path");
+        } else if (a == "--embeddings") {
+            g_embeddings_mode = true;
+        } else if (a == "--no-embeddings") {
+            g_embeddings_mode = false;
         }
     }
 
@@ -891,10 +898,20 @@ int main(int argc, char ** argv) {
     // params.embedding=true the cparams.embeddings flag forces
     // output_all=true on every llama_decode, so the prefill routes all
     // tokens through every MoE layer.
+    //
+    // NB: the cb_eval hook fires for every ffn_moe_topk-<il> tensor in the
+    // compute graph regardless of params.embedding. Setting embedding=true
+    // is therefore NOT required to capture routing counts - it only
+    // affects whether the OUTPUT tensor is materialised. On long
+    // multilingual prefills (e.g. Greek/INCLUDE questions), embedding=true
+    // triggers a CUDA "illegal memory access" in the MoE routing kernel
+    // (observed on A100 PCIe + A100 NVLink, both llama.cpp master and
+    // e5df8bfb8). Default embedding=false (set --embeddings to opt back
+    // in to the old behaviour for A/B testing).
     params.cb_eval           = moe_eval_callback;
     params.cb_eval_user_data = &g_acc;
     params.warmup            = false;
-    params.embedding         = true;
+    params.embedding         = g_embeddings_mode;
 
     auto   init_result = common_init_from_params(params);
     auto * model       = init_result->model();

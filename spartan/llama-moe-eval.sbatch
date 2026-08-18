@@ -242,6 +242,15 @@ fi
 # -DGGML_CUDA_NO_PEER_COPY is gated by #ifdef and the topology-driven
 # probe flips it between submissions.
 : "${REBUILD:=0}"
+# EMBD=1 forwards --embeddings to the eval binaries (forces
+# cparams.embeddings=true -> output_all=true on every llama_decode).
+# Default 0 (--no-embeddings) because embedding=true triggers a CUDA
+# illegal-memory-access bug on long multilingual prefills (Greek/INCLUDE
+# questions at >3500 tokens), reproducible on both A100 PCIe and
+# A100 NVLink partitions. The cb_eval hook captures routing counts
+# regardless of params.embedding, so the routing data is identical with
+# or without --embeddings.
+: "${EMBD:=0}"
 : "${SKIP_PYTHON_PLOTS:=1}"     # 1 = skip ALL python post-processing (plots,
                                  #     routing graphs, jaccard sweep);
                                  # 0 = run all of them. Default 1 because
@@ -277,6 +286,7 @@ echo "[$(date -Iseconds)] NGPUS             = ${NGPUS}"
 echo "[$(date -Iseconds)] EXTRA_TENSOR_SPLIT= ${EXTRA_TENSOR_SPLIT:-auto (${NGPUS}-way uniform)}"
 echo "[$(date -Iseconds)] SKIP_PYTHON_PLOTS = ${SKIP_PYTHON_PLOTS}"
 echo "[$(date -Iseconds)] REBUILD            = ${REBUILD}"
+echo "[$(date -Iseconds)] EMBD               = ${EMBD}"
 echo "============================================================"
 
 # ---------------------------------------------------------------- modules
@@ -540,6 +550,11 @@ if [[ -n "${MODELS_OVERRIDE}" ]]; then
 fi
 if [[ "${REBUILD:-0}" -eq 1 ]]; then
     RUN_ARGS+=( --rebuild )
+fi
+if [[ "${EMBD:-0}" -eq 1 ]]; then
+    RUN_ARGS+=( --embeddings )
+else
+    RUN_ARGS+=( --no-embeddings )
 fi
 if [[ -n "${DATASETS_OVERRIDE}" ]]; then
     # shellcheck disable=SC2206

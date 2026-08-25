@@ -213,6 +213,15 @@ static void tally_pairs_for_question(moe_accumulator & acc) {
 
     auto get = [&](int L, int tok, int j) -> int32_t {
         const auto & layer = acc.current_topk[L];
+        // Dense (non-MoE) layer: the ffn_moe_topk-<il> tensor never
+        // materialised, so current_topk[L] is still empty. Return -1 so
+        // callers' `if (e1 < 0 || ...) continue;` filter skips it.
+        // Without this, e.g. deepseek-moe-16b's leading dense layer
+        // (n_layer_dense_lead=1, layer 0) would crash on an out-of-bounds
+        // vector read inside this lambda.
+        if (layer.empty()) {
+            return -1;
+        }
         return layer[(size_t) tok * stride1 + (size_t) j];
     };
 

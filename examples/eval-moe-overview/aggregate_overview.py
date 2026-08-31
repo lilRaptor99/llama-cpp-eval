@@ -178,6 +178,7 @@ def _load_one(path: Path, default_L: int = 16, default_E: int = 64,
     # can fall back to the count-only heatmap.
     marginal: np.ndarray | None = None
     adj: np.ndarray | None = None
+    layer_min: list[int] | None = None
     agg = data.get("aggregate")
     if isinstance(agg, dict):
         marg_raw = agg.get("marginal_expert_counts")
@@ -192,6 +193,13 @@ def _load_one(path: Path, default_L: int = 16, default_E: int = 64,
             adj_arr = np.asarray(adj_raw, dtype=np.int64)
             if adj_arr.shape == (max(L - 1, 0), E, E):
                 adj = adj_arr
+        # Per-layer minimum n_tokens observed across all decode calls. Older
+        # binaries lack this field; we just leave it as None.
+        lm_raw = agg.get("layer_min_topk_n_tokens")
+        if lm_raw is not None:
+            lm_list = list(lm_raw)
+            if len(lm_list) == L:
+                layer_min = [int(x) for x in lm_list]
     has_aggregate = (marginal is not None) and (adj is not None)
 
     dataset_label = path.parent.name  # e.g. "moe-humaneval"
@@ -211,6 +219,7 @@ def _load_one(path: Path, default_L: int = 16, default_E: int = 64,
         "marginal": marginal,
         "adj": adj,
         "has_aggregate": has_aggregate,
+        "layer_min_topk_n_tokens": layer_min,
         "per_dataset_meta": {
             "dataset": dataset_label,
             "tokens": int(total_tokens),
@@ -330,6 +339,86 @@ def _colorbar_millions_formatter(x: float, pos: int) -> str:
     return f"{int(x)}"
 
 
+def _compute_overview_collapse_note(
+    counts_total: np.ndarray,
+    layer_min_total: list[int] | None,
+) -> str:
+    """Same logic as ``_compute_collapse_note`` in the shared routing-graph
+    module, but for the overview aggregator.
+
+    Uses the per-layer marginal sum of the AGGREGATED ``counts_total``
+    matrix as the primary signal (a layer whose marginal is significantly
+    smaller than the median was evaluated with fewer tokens, almost
+    always because of the universal ``ggml_get_rows(cur, inp_out_ids)``
+    last-layer collapse).
+
+    `layer_min_total` (the min per layer min across datasets) is passed
+    in only as supporting evidence; for generative benchmarks it's 1 for
+    every layer anyway, so the marginal-based signal does the actual work.
+
+    Returns "" if there is nothing to report (e.g. all layers healthy).
+    The returned string is meant to be appended directly to the matplotlib
+    title.
+    """
+    if counts_total is None or counts_total.size == 0:
+        return ""
+    marginal_per_layer_sum = counts_total.sum(axis=1).astype(np.int64).tolist()
+    L = len(marginal_per_layer_sum)
+    non_zero = [v for v in marginal_per_layer_sum if v > 0]
+    if not non_zero:
+        return ""
+    sorted_nz = sorted(non_zero)
+    median = sorted_nz[len(sorted_nz) // 2]
+    if median <= 0:
+        return ""
+    threshold = max(1, int(median * 0.5))
+    dense_layers: list[int] = []
+    collapsed: list[tuple[int, float]] = []
+    for i, v in enumerate(marginal_per_layer_sum):
+        if v == 0:
+            dense_layers.append(i)
+        elif v < threshold:
+            collapsed.append((i, v / median))
+    if not dense_layers and not collapsed:
+        return ""
+    if len(dense_layers) == L:
+        return ""
+    parts: list[str] = []
+    if dense_layers:
+        if len(dense_layers) <= 4:
+            parts.append("dense (no MoE): " + ", ".join(str(i) for i in dense_layers))
+        else:
+            parts.append(f"dense (no MoE): {len(dense_layers)} layers")
+    if collapsed:
+        collapsed.sort(key=lambda x: x[0])
+        if len(collapsed) <= 4:
+            collapsed_str = ", ".join(
+                f"L{i} ({ratio * 100:.1f}% of median)" for i, ratio in collapsed
+            )
+            parts.append(f"collapsed: {collapsed_str}")
+        else:
+            parts.append(
+                f"collapsed: {len(collapsed)} layers "
+                f"(smallest {min(r for _, r in collapsed) * 100:.1f}% of median)"
+            )
+    # Hint when collapses are clustered at the end (last-layer ggml_get_rows).
+    if collapsed:
+        collapsed_indices = [i for i, _ in collapsed]
+        n_at_end = sum(1 for i in collapsed_indices if i == L - 1 or i == L - 2)
+        hint = ""
+        if n_at_end and n_at_end == len(collapsed_indices):
+            hint = (
+                " (typically the last layer; ggml inp_out_ids "
+                "shrinks it to n_outputs tokens)"
+            )
+        elif len(collapsed_indices) >= 2 and all(
+            i >= L - len(collapsed_indices) - 1 for i in collapsed_indices
+        ):
+            hint = " (likely last-layer ggml inp_out_ids collapse)"
+        parts[-1] = parts[-1] + hint
+    return "\nNote: " + "; ".join(parts)
+
+
 def _filter_top_k_pairs(adj: np.ndarray, K: int) -> list[list[tuple[int, int, int]]]:
     """For each layer pair L, return the top-K (e_i, e_j, count) triples.
 
@@ -375,6 +464,7 @@ def _draw_circle_grid_overview(
     adj: Optional[np.ndarray] = None,
     top_k_pairs: int = DEFAULT_OVERVIEW_TOP_K_PAIRS,
     line_scale: float = DEFAULT_OVERVIEW_LINE_SCALE,
+    collapse_note: str = "",
 ) -> None:
     """Render the overview heatmap as a circle grid (mirrors routing_graph).
 
@@ -549,7 +639,7 @@ def _draw_circle_grid_overview(
         f"{model_id}{quant_str}  -  MoE expert activation counts "
         f"(top-{top_k} of {E})\n"
         f"aggregated across all datasets; {total_tokens:,} tokens"
-        f"{highlight_str}{lines_str}",
+        f"{highlight_str}{lines_str}{collapse_note}",
         fontsize=11, pad=14,
     )
 
@@ -567,6 +657,7 @@ def save_overview_heatmap(counts: np.ndarray, total_tokens: int,
                           adj: Optional[np.ndarray] = None,
                           top_k_pairs: int = DEFAULT_OVERVIEW_TOP_K_PAIRS,
                           line_scale: float = DEFAULT_OVERVIEW_LINE_SCALE,
+                          collapse_note: str = "",
                           ) -> None:
     """Overview heatmap: L x E circle grid, blue gradient, linear scale.
 
@@ -580,11 +671,18 @@ def save_overview_heatmap(counts: np.ndarray, total_tokens: int,
     ``top_k_pairs`` adjacent-layer co-activation pairs are drawn as dark
     blue lines (line thickness proportional to raw count, same contract
     as the routing graph). Pass ``top_k_pairs=0`` to disable the lines.
+
+    ``collapse_note`` is an optional title annotation listing layers that
+    were evaluated with substantially fewer tokens (typically the universal
+    ``ggml_get_rows(cur, inp_out_ids)`` collapse on the last layer, plus
+    dense leading layers that emit no MoE routing tensor at all). Empty
+    string = no annotation.
     """
     _draw_circle_grid_overview(
         counts, total_tokens, model_id, arch, top_k, top_k_count,
         top_k_per_layer=None, path=path, dpi=dpi,
         quant=quant, adj=adj, top_k_pairs=top_k_pairs, line_scale=line_scale,
+        collapse_note=collapse_note,
     )
 
 
@@ -597,6 +695,7 @@ def save_highlighted_heatmap(counts: np.ndarray, total_tokens: int,
                               adj: Optional[np.ndarray] = None,
                               top_k_pairs: int = DEFAULT_OVERVIEW_TOP_K_PAIRS,
                               line_scale: float = DEFAULT_OVERVIEW_LINE_SCALE,
+                              collapse_note: str = "",
                               ) -> None:
     """Same overview heatmap with red rings around top-K cells per layer.
 
@@ -613,6 +712,7 @@ def save_highlighted_heatmap(counts: np.ndarray, total_tokens: int,
         counts, total_tokens, model_id, arch, top_k, top_k_count,
         top_k_per_layer=top_k_per_layer, path=path, dpi=dpi,
         quant=quant, adj=adj, top_k_pairs=top_k_pairs, line_scale=line_scale,
+        collapse_note=collapse_note,
     )
 
 
@@ -711,6 +811,10 @@ def process_model(model_dir: Path, json_paths: list[Path],
     arch: dict[str, Any] | None = None
     counts_total = None
     adj_total: np.ndarray | None = None
+    # Per-layer min n_tokens aggregated across all datasets that have the
+    # `layer_min_topk_n_tokens` field (newer eval-moe-* binaries only).
+    # Initialised lazily on the first valid dataset, then min-ed per layer.
+    layer_min_total: list[int] | None = None
     n_datasets_with_agg = 0
     n_datasets_missing_agg = 0
     total_tokens = 0
@@ -727,6 +831,22 @@ def process_model(model_dir: Path, json_paths: list[Path],
             continue
 
         ds_name = loaded["dataset_label"]
+        # Aggregate per-layer min n_tokens across datasets as we go. We take
+        # the min per layer so a layer that's collapsed to 1 token in any
+        # dataset is flagged in the overview too. INT64_MAX means "unknown"
+        # (older binary); we treat it as "no observation" so the layer_max
+        # remains dominant. We tolerate older binaries by leaving the
+        # corresponding layer at the layer_max from newer datasets.
+        dlm = loaded.get("layer_min_topk_n_tokens")
+        if dlm is not None and arch is not None and len(dlm) == arch["n_layer"]:
+            if layer_min_total is None:
+                layer_min_total = [int(x) for x in dlm]
+            else:
+                for i, v in enumerate(dlm):
+                    iv = int(v)
+                    if iv < layer_min_total[i]:
+                        layer_min_total[i] = iv
+
         if model_id is None:
             model_id = loaded["model_id"]
             arch = loaded["arch"]
@@ -816,6 +936,15 @@ def process_model(model_dir: Path, json_paths: list[Path],
                 f"-- the count distribution may be near-flat"
             )
 
+    # Build the collapse-note for the overview heatmap title. Layers whose
+    # min-observed n_tokens across aggregated datasets is significantly
+    # smaller than the dataset's typical prefill length are flagged so the
+    # viewer can explain why their circles render as near-white in the
+    # globally-normalised Blues heatmap. Same logic as the per-dataset
+    # routing graph viewer (see _compute_collapse_note in
+    # examples/_shared/moe_routing_graph.py).
+    collapse_note = _compute_overview_collapse_note(counts_total, layer_min_total)
+
     # ----------------------------------------------------------------- persist
     # 1. Overview heatmap (circle grid, blue gradient, linear raw counts,
     #    plus top-K adjacent-layer co-activation lines when available).
@@ -824,6 +953,7 @@ def process_model(model_dir: Path, json_paths: list[Path],
         counts_total, total_tokens, model_id or model_dir.name, arch,
         top_k, top_k_count, p, dpi=dpi, quant=quant,
         adj=adj_total, top_k_pairs=top_k_pairs, line_scale=line_scale,
+        collapse_note=collapse_note,
     )
     print(f"[save] {p}")
 
@@ -834,6 +964,7 @@ def process_model(model_dir: Path, json_paths: list[Path],
         counts_total, total_tokens, model_id or model_dir.name, arch,
         top_k, top_k_count, top_k_per_layer, p, dpi=dpi, quant=quant,
         adj=adj_total, top_k_pairs=top_k_pairs, line_scale=line_scale,
+        collapse_note=collapse_note,
     )
     print(f"[save] {p}")
 
@@ -898,6 +1029,15 @@ def process_model(model_dir: Path, json_paths: list[Path],
         payload["adjacent_pair_counts"] = adj_total.tolist()
         payload["adjacent_pair_counts_shape"] = list(adj_total.shape)
         payload["adjacent_pair_counts_total"] = int(adj_total.sum())
+    # Per-layer minimum n_tokens observed across all aggregated datasets.
+    # A layer with min << max for that JSON was collapsed by the universal
+    # `ggml_get_rows(cur, inp_out_ids)` pattern in every model file
+    # (typically the last layer; sometimes dense leading layers emit no
+    # tensor at all which we surface as 0). Downstream viewers read this
+    # to annotate the routing-graph title with a "note" line so users
+    # understand why the last row of the heatmap looks near-empty.
+    if layer_min_total is not None:
+        payload["layer_min_topk_n_tokens"] = list(layer_min_total)
     with open(p, "w") as f:
         json.dump(payload, f)
     print(f"[save] {p}")
@@ -928,9 +1068,22 @@ def process_model(model_dir: Path, json_paths: list[Path],
             "line_scale": float(line_scale),
         },
     }
+    # Per-layer minimum n_tokens observed across aggregated datasets.
+    # Same field name as the per-dataset C++ eval binary
+    # (`layer_min_topk_n_tokens` in `aggregate`). Layer values that are
+    # much smaller than the dataset's typical prefill length flag layers
+    # collapsed by the universal `ggml_get_rows(cur, inp_out_ids)` pattern
+    # in the model files (typically the last layer).
+    if layer_min_total is not None:
+        meta["layer_min_topk_n_tokens"] = list(layer_min_total)
     with open(p, "w") as f:
         json.dump(meta, f, indent=2)
     print(f"[save] {p}")
+
+    if collapse_note:
+        # Surface the same note on stdout so headless users / CI logs can
+        # see it without opening the PNG.
+        print(collapse_note.strip().replace("\n", "  "))
 
     return {
         "model_dir": model_dir,
@@ -942,6 +1095,8 @@ def process_model(model_dir: Path, json_paths: list[Path],
         "n_datasets_used": n_datasets_used,
         "n_datasets_skipped": n_datasets_skipped,
         "output_dir": output_dir,
+        "layer_min_topk_n_tokens": layer_min_total,
+        "collapse_note": collapse_note,
     }
 
 
@@ -1040,13 +1195,46 @@ def main() -> int:
 
     # Stdout summary table.
     print("\n[summary]")
-    cols = ("model", "quant", "arch", "LxE", "top_k", "datasets", "tokens")
-    header_widths = {"LxE": 10, "top_k": 6, "datasets": 8}
+    cols = ("model", "quant", "arch", "LxE", "top_k", "datasets", "tokens", "collapsed layers")
+    header_widths = {"LxE": 10, "top_k": 6, "datasets": 8, "collapsed layers": 30}
     print("  ".join(
         f"{c:<{header_widths.get(c, 28)}}" for c in cols
     ))
     for s in summaries:
         arch = s["arch"]
+        # Short "collapsed" indicator: count of layers whose aggregated
+        # marginal is < 50% of the median across layers. Hides the long
+        # title note in the table itself but lets users spot affected
+        # (model, quant) cells at a glance. We derive this from the
+        # `counts_total` matrix via the archived summary; if not present
+        # we fall back to the legacy `layer_min_topk_n_tokens` field.
+        collapsed_str = "(no data)"
+        # Pull the aggregated counts_total back out of the JSON if possible
+        # to recompute marginal per-layer sums (so generative benchmarks
+        # are correctly flagged via the same signal as the per-dataset
+        # viewer).
+        try:
+            ct_path = s["output_dir"] / "counts_total_overview.json"
+            if ct_path.exists():
+                with open(ct_path) as f:
+                    ct = json.load(f)
+                arr = np.asarray(ct.get("counts_total", []), dtype=np.int64)
+                if arr.ndim == 2 and arr.shape[0] == arch["n_layer"]:
+                    sums = arr.sum(axis=1).astype(np.int64).tolist()
+                    nz = [v for v in sums if v > 0]
+                    if nz:
+                        med = sorted(nz)[len(nz) // 2]
+                        thr = max(1, int(med * 0.5))
+                        n_collapsed = sum(1 for v in sums if 0 < v < thr)
+                        n_dense = sum(1 for v in sums if v == 0)
+                        parts = []
+                        if n_collapsed:
+                            parts.append(f"{n_collapsed} collapsed")
+                        if n_dense:
+                            parts.append(f"{n_dense} dense")
+                        collapsed_str = ", ".join(parts) if parts else "—"
+        except (OSError, KeyError, json.JSONDecodeError):
+            pass
         print(
             "  ".join([
                 f"{(s['model_id'] or s['model_dir'].name):<28}",
@@ -1056,6 +1244,7 @@ def main() -> int:
                 f"{s['top_k_count']:<6}",
                 f"{s['n_datasets_used']:<8}",
                 f"{s['tokens_total']:,}",
+                f"{collapsed_str}",
             ])
         )
     n_models = len({s['model_dir'].name for s in summaries})

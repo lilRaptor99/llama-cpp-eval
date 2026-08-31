@@ -93,7 +93,27 @@ struct moe_accumulator {
     // tally_pairs_for_question() right after llama_decode() returns.
     // current_topk[il].size() = stride1 * n_tokens for the current decode.
     std::vector<std::vector<int32_t>> current_topk;
+    // Per-layer n_tokens that the current decode's ffn_moe_topk-<il> tensor
+    // was emitted with. Most layers get the full prefill (e.g. 650 tokens
+    // for an MMLU question), but the universal pattern
+    //   if (il == n_layer - 1 && inp_out_ids) cur = ggml_get_rows(cur, inp_out_ids);
+    // in every model file (olmoe.cpp, deepseek2.cpp, openai-moe.cpp,
+    // llama.cpp, ...) shrinks the last layer's FFN input to
+    // `inp_out_ids.size()` tokens (typically 1). Without a per-layer bounds
+    // check in the `get()` accessor of tally_pairs_for_question(), the
+    // iterators would read past the end of the buffer for that collapsed
+    // layer (and the (n_layer-2, n_layer-1) adjacent pair would accumulate
+    // garbage). See the empty-check + bounds-check in `get()`.
     int                               current_n_tokens = 0;
+    std::vector<int>                  current_topk_n_tokens;
+
+    // Per-layer minimum n_tokens observed across ALL decodes in this run.
+    // Emitted in the aggregate block as `layer_min_topk_n_tokens` so the
+    // visualisation layer can detect collapsed layers (e.g. the universal
+    // ggml_get_rows collapse on the last layer) and annotate accordingly.
+    // INT64_MAX means no ffn_moe_topk tensor has been seen for this layer
+    // yet (dense layer, or first-decode not yet captured).
+    std::vector<int64_t>              min_topk_n_tokens_seen;
 
     // expose shape on first capture so we can validate later tensors
     int seen_k = -1;
@@ -189,6 +209,28 @@ static bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data
         g_acc.current_n_tokens = ntok;
     }
 
+    // Per-layer n_tokens tracker: each layer's ffn_moe_topk-<il> may be
+    // emitted with a different n_tokens (the last layer is collapsed by the
+    // universal `ggml_get_rows(cur, inp_out_ids)` pattern when embedding=
+    // false). The tally_pairs lambda uses current_topk_n_tokens[L] to skip
+    // tokens that weren't routed through layer L. See the bounds-check in
+    // `get()`. We DON'T re-assign on every callback (only on the first that
+    // sees an empty vector), so subsequent layers' values from THIS decode
+    // are preserved; values from the PREVIOUS decode are overwritten by
+    // tally_pairs_for_question's reset at the end.
+    if (g_acc.current_topk_n_tokens.size() != (size_t) g_acc.n_layer) {
+        g_acc.current_topk_n_tokens.assign(g_acc.n_layer, 0);
+    }
+    g_acc.current_topk_n_tokens[il] = ntok;
+
+    // Track per-layer min for the visualisation layer (see struct field).
+    if (g_acc.min_topk_n_tokens_seen.size() != (size_t) g_acc.n_layer) {
+        g_acc.min_topk_n_tokens_seen.assign(g_acc.n_layer, INT64_MAX);
+    }
+    if ((int64_t) ntok < g_acc.min_topk_n_tokens_seen[il]) {
+        g_acc.min_topk_n_tokens_seen[il] = (int64_t) ntok;
+    }
+
     return true;
 }
 
@@ -213,13 +255,27 @@ static void tally_pairs_for_question(moe_accumulator & acc) {
 
     auto get = [&](int L, int tok, int j) -> int32_t {
         const auto & layer = acc.current_topk[L];
-        // Dense (non-MoE) layer: the ffn_moe_topk-<il> tensor never
-        // materialised, so current_topk[L] is still empty. Return -1 so
-        // callers' `if (e1 < 0 || ...) continue;` filter skips it.
-        // Without this, e.g. deepseek-moe-16b's leading dense layer
-        // (n_layer_dense_lead=1, layer 0) would crash on an out-of-bounds
-        // vector read inside this lambda.
+        // Two ways the read can be out of range:
+        //   1. The layer is dense (no ffn_moe_topk tensor was emitted, e.g.
+        //      deepseek-moe-16b's leading dense layer). current_topk[L] is
+        //      empty -> return -1 so the caller's filter skips it.
+        //   2. The layer's n_tokens for this decode is fewer than the
+        //      maximum across layers (the loop's `ntok`). This happens for
+        //      the LAST layer under the universal
+        //      `if (il == n_layer - 1 && inp_out_ids) ggml_get_rows(...)`
+        //      pattern in every model file (olmoe, deepseek2, openai-moe,
+        //      llama, ...), which shrinks the last layer's FFN input to
+        //      `inp_out_ids.size()` tokens (typically 1). Without this
+        //      guard, layer[tok*stride1+j] reads past the end of the
+        //      buffer, producing garbage in the intra-pair and adjacent-
+        //      pair counts for that layer (and the (n_layer-2, n_layer-1)
+        //      adjacent pair in particular, where `get(L+1, tok, j)` with
+        //      tok >= the last layer's actual n_tokens would OOB-read).
         if (layer.empty()) {
+            return -1;
+        }
+        const int layer_ntok = acc.current_topk_n_tokens[L];
+        if (layer_ntok <= 0 || tok < 0 || tok >= layer_ntok) {
             return -1;
         }
         return layer[(size_t) tok * stride1 + (size_t) j];
@@ -278,6 +334,9 @@ static void tally_pairs_for_question(moe_accumulator & acc) {
     // Release the per-decode slice buffer immediately to bound memory at
     // ~n_layer * stride1 * ntok * 4 bytes (~30-60 KB for OLMoE prefill).
     acc.current_n_tokens = 0;
+    std::fill(acc.current_topk_n_tokens.begin(),
+              acc.current_topk_n_tokens.end(),
+              0);
     for (auto & layer : acc.current_topk) {
         std::vector<int32_t>().swap(layer);
     }
@@ -809,21 +868,34 @@ int main(int argc, char ** argv) {
     llama_numa_init(params.numa);
 
     // Wire the eval callback BEFORE context creation (params.cb_eval is
-    // consumed when common_init_from_params builds the context). With
-    // params.embedding=true the cparams.embeddings flag forces
-    // output_all=true on every llama_decode, so the prefill routes all
-    // tokens through every MoE layer (without this only the last position
-    // flows through MoE because inp_out_ids has size 1).
+    // consumed when common_init_from_params builds the context).
     //
-    // NB: the cb_eval hook fires for every ffn_moe_topk-<il> tensor in the
-    // compute graph regardless of params.embedding. Setting embedding=true
-    // is therefore NOT required to capture routing counts - it only
-    // affects whether the OUTPUT tensor is materialised. On long
-    // multilingual prefills (e.g. Greek/INCLUDE questions), embedding=true
-    // triggers a CUDA "illegal memory access" in the MoE routing kernel
-    // (observed on A100 PCIe + A100 NVLink, both llama.cpp master and
-    // e5df8bfb8). Default embedding=false (set --embeddings to opt back
-    // in to the old behaviour for A/B testing).
+    // `params.embedding` -> `cparams.embeddings` -> `output_all` in
+    // llama_decode. With output_all=true the model's
+    // `if (il == n_layer - 1 && inp_out_ids)` gate (deepseek2.cpp:368,
+    // qwen3moe.cpp, gpt-oss.cpp, etc.) becomes a no-op because
+    // inp_out_ids is null when all tokens are output. Without
+    // output_all=true, inp_out_ids selects the last logit position
+    // (size 1), and the last MoE layer only routes that single token -
+    // producing the "last-layer zeros" symptom in expert_counts.json
+    // where marginal counts for layer n_layer-1 are ~1/Q of the other
+    // layers.
+    //
+    // NB: the cb_eval hook fires for every ffn_moe_topk-<il> tensor in
+    // the compute graph regardless of params.embedding. Setting
+    // embedding=true is therefore NOT required to capture routing
+    // counts - it only affects whether the OUTPUT tensor is
+    // materialised.
+    //
+    // CPU vs GPU: on CPU the cuda-specific MoE routing kernel OOB is
+    // not a concern, so --embeddings is the recommended default. On
+    // GPU the historical default was --no-embeddings because
+    // embedding=true triggers a CUDA "illegal memory access" in the
+    // MoE routing kernel on long multilingual prefills (observed on
+    // A100 PCIe + A100 NVLink, both llama.cpp master and e5df8bfb8);
+    // pass --no-embeddings to reproduce that behaviour. The default
+    // below is overridable via --embeddings / --no-embeddings on the
+    // command line.
     params.cb_eval           = moe_eval_callback;
     params.cb_eval_user_data = &g_acc;
     params.warmup            = false;
@@ -1153,7 +1225,31 @@ int main(int argc, char ** argv) {
     write_json_3d_int_array(fout, intra_total);
     std::fprintf(fout, ",\n    \"adjacent_pair_counts\": ");
     write_json_3d_int_array(fout, adj_total);
-    std::fprintf(fout, "\n  },\n");
+    // Per-layer minimum n_tokens observed across all decode calls. A layer
+    // with min_tokens << max_tokens (e.g. 1 vs 650) was collapsed by the
+    // universal
+    //   if (il == n_layer - 1 && inp_out_ids) cur = ggml_get_rows(cur, inp_out_ids);
+    // pattern in every model file, which shrinks the last layer's FFN
+    // input to inp_out_ids.size() tokens. The Python routing-graph viewer
+    // reads this vector and annotates collapsed layers in the title so the
+    // user understands why the last row of the heatmap looks nearly empty
+    // (the data is non-zero but evaluated with 1 token per decode instead
+    // of N). INT64_MAX means no ffn_moe_topk tensor was ever captured for
+    // that layer (dense layer, e.g. deepseek-moe-16b's first layer); the
+    // JSON writes 0 in that case.
+    std::fprintf(fout, ",\n    \"layer_min_topk_n_tokens\": [");
+    for (int L = 0; L < g_acc.n_layer; ++L) {
+        if (L > 0) {
+            std::fprintf(fout, ", ");
+        }
+        int64_t v = g_acc.min_topk_n_tokens_seen[L];
+        if (v == INT64_MAX) {
+            v = 0;
+        }
+        std::fprintf(fout, "%lld", (long long) v);
+    }
+    std::fprintf(fout, "]\n");
+    std::fprintf(fout, "  },\n");
 
     std::fprintf(fout, "  \"props\": {\n");
 

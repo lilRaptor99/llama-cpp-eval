@@ -30,9 +30,10 @@ readonly REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # will download + cache the GGUF on first use.
 readonly DEFAULT_MODELS=(
     "allenai/OLMoE-1B-7B-0125-Instruct-GGUF"
-    "LiteLLMs/Mixtral-8x22B-Instruct-v0.1-GGUF"
-    "mradermacher/deepseek-moe-16b-chat-i1-GGUF"
+    "Lucy-in-the-Sky/deepseek-moe-16b-chat-Q8_0-GGUF"
+    #"mradermacher/deepseek-moe-16b-chat-i1-GGUF"
     "unsloth/gpt-oss-120b-GGUF"
+    "LiteLLMs/Mixtral-8x22B-Instruct-v0.1-GGUF"
 )
 
 # --------------------------------------------------------- defaults / state
@@ -48,44 +49,52 @@ REDOWNLOAD=0
 SKIP_PLOTS=0
 SKIP_ROUTING_GRAPHS=0
 USE_CUDA=0
+CPU_ONLY=0
 PRINT_USAGE=0
 # Per-routing-graph --line-scale. Tune to match the magnitude of your
 # pair counts: OLMoE (~1e7 pair counts) wants ~1e-4, Mixtral (~1e6) wants
 # ~1e-5. Empty means use the wrapper default (5e-7).
 LINE_SCALE="${ROUTING_GRAPH_LINE_SCALE:-}"
 # Forwarded to the C++ binary as --numa / -ngl / --split-mode /
-# --tensor-split. Defaults below were tuned for single-A100 + 4xA100
-# PCIe partitions (gpu-a100 on Spartan):
-#   - NUMA_MODE=isolate avoids the "illegal memory access" race in
-#     ggml_cuda's first launch (observed on OLMoE/include) and stops
-#     pinning per-expert allocations to the wrong NUMA node on
-#     multi-GPU PCIe boxes (observed slowing Mixtral by ~30%).
-#   - NGL=99 fully offloads every model we run (all fit in 4x80GB) but
-#     uses the safer integer the way llama.cpp's scheduler expects;
-#     -ngl 999 occasionally trips a first-launch scratch reallocation.
-#   - SPLIT_MODE controls how the model is laid out across GPUs visible
-#     to the binary. llama.cpp's own default is `layer` (each layer on
-#     one GPU, KV buffer sharded). Our default is also `layer` because
-#     SLURM gives us >=1 GPU and we want to actually use them all. If
-#     you really want single-GPU mode (e.g. to compare 1-GPU vs 4-GPU
-#     throughput), set SPLIT_MODE=none. With n_gpu == 1 (CPU-only build
-#     or --gres=gpu:1) the split-mode flag is a no-op, so it's always
-#     safe to leave the default.
-#   - EXTRA_TENSOR_SPLIT is comma-separated fractions summing to ~1.0
-#     (e.g. "50,50" for 2 GPUs or "25,25,25,25" for 4). Empty means
-#     auto-balance (llama.cpp's behaviour). We auto-derive a uniform
-#     split when this is empty so the multi-GPU case actually spreads
-#     layers instead of falling back to all-on-GPU-0.
+# --tensor-split. Defaults below were tuned for CPU-only execution
+# (the intended deployment for this fork - no CUDA, no GPUs):
+#   - NUMA_MODE=isolate is the safer default on a single-socket CPU VM
+#     (we observed it avoids the ggml_cuda first-launch race on multi-
+#     GPU boxes but it's also a no-op on CPU-only boxes, so we keep it).
+#     Set NUMA_MODE=distribute if you have NUMA-aware workload issues.
+#   - NGL=0 means "no GPU layers offloaded" - everything runs on CPU.
+#     This is the safe default for CPU-only machines; the C++ binary
+#     ignores -ngl 0 when CUDA isn't compiled in. If you do have a GPU
+#     and want to use it, pass --ngl <N> (typically 99 to fully offload).
+#   - SPLIT_MODE / EXTRA_TENSOR_SPLIT are GPU-only flags. With NGL=0
+#     (CPU mode) they're no-ops, so we leave the original defaults
+#     (`layer` and empty, which auto-derives a uniform split) intact
+#     for anyone running on a GPU box.
 NUMA_MODE="${NUMA_MODE:-isolate}"
-NGL="${NGL:-99}"
+NGL="${NGL:-0}"
 SPLIT_MODE="${SPLIT_MODE:-layer}"
 EXTRA_TENSOR_SPLIT="${EXTRA_TENSOR_SPLIT:-}"
 # EMBD: forwarded as --embeddings / --no-embeddings to the eval binaries.
-# Default 0 (no embeddings) to avoid the CUDA illegal-memory-access bug
-# we hit with embedding=true on long multilingual prefills; the cb_eval
-# hook still captures routing data either way. Set EMBD=1 to opt back
-# into the old behaviour for A/B testing.
-EMBD="${EMBD:-0}"
+# Set EMBD=1 (default for CPU) so that cparams.embeddings=true forces
+# output_all=true in llama_decode; with output_all=true the model's
+# `if (il == n_layer - 1 && inp_out_ids) cur = ggml_get_rows(cur, inp_out_ids);`
+# pattern (olmoe.cpp:124 and a dozen others) collapses inp_out_ids to
+# size 1 and routes only the LAST token through the final MoE layer.
+# This produces the "last-layer zeros" symptom in expert_counts.json:
+# marginal counts for layer n_layer-1 are ~1/Q of the other layers.
+# On CPU this collapse is purely a data artefact (no CUDA OOB bug to
+# worry about - that one only triggers in ggml_cuda's MoE routing
+# kernel on long multilingual prefills). Setting EMBD=0 (or passing
+# --no-embeddings) reproduces the old CUDA-style behaviour and is
+# only useful for A/B comparisons against an existing GPU run.
+EMBD="${EMBD:-1}"
+# N_SHOTS: few-shot exemplars drawn from each subject/langdom's dev split.
+# Forwarded as --n-shots N to the C++ binary. Only applies to datasets
+# that have few-shot prompting (mmlu, include); popqa/bigbench/humaneval
+# are generative and ignore this flag. Empty means "use the per-dataset
+# hardcoded default" (5 for mmlu, 5 for include - matches the published
+# OLMoE MMLU 5-shot setup). Set to 0 for zero-shot prompting.
+N_SHOTS="${N_SHOTS:-}"
 
 declare -A STATUS=()
 
@@ -152,13 +161,31 @@ routing_graph_for() {
 # Dataset-specific C++ flags to control eval size + few-shot + decoding.
 # Tweak per hardware budget - the values match the per-dataset README
 # "Quick smoke test" recommendations.
+#
+# N_SHOTS override: when the global $N_SHOTS env var (or --n-shots CLI
+# flag) is set, override the --n-shots value for the datasets that
+# support it (mmlu, include). popqa/bigbench/humaneval are generative
+# and don't take --n-shots - their config lines are emitted verbatim.
+# Set N_SHOTS=0 for zero-shot prompting.
 config_flags_for() {
     case "$1" in
-        mmlu)     printf -- '--questions-per-subject 100 --n-shots 5' ;;
+        mmlu)
+            if [[ -n "${N_SHOTS}" ]]; then
+                printf -- '--questions-per-subject 100 --n-shots %s' "${N_SHOTS}"
+            else
+                printf -- '--questions-per-subject 100 --n-shots 5'
+            fi
+            ;;
         popqa)    printf -- '--questions-per-prop 100 --gen-tokens 16' ;;
         bigbench) printf -- '--questions-per-task 100 --gen-tokens 128' ;;
         humaneval) printf -- '--questions-per-task 164 --gen-tokens 256' ;;
-        include)  printf -- '--questions-per-langdom 50 --n-shots 5 --gen-tokens 16' ;;
+        include)
+            if [[ -n "${N_SHOTS}" ]]; then
+                printf -- '--questions-per-langdom 50 --n-shots %s --gen-tokens 16' "${N_SHOTS}"
+            else
+                printf -- '--questions-per-langdom 50 --n-shots 5 --gen-tokens 16'
+            fi
+            ;;
         *) _die "config_flags_for: unknown dataset '$1'" ;;
     esac
 }
@@ -225,24 +252,44 @@ Options:
   --numa <mode>                  forwarded as --numa <mode> to the C++ binary
                                   (default: isolate; try "distribute" or empty
                                   if you have NUMA-aware workload issues)
-  --ngl <int>                    forwarded as -ngl <int> (default: 99)
-                                  99 fully offloads every model that fits in
-                                  VRAM; safer than 999 against first-launch
-                                  scratch races in ggml_cuda
+  --ngl <int>                    forwarded as -ngl <int> (default: 0)
+                                  0 = no GPU offload (CPU-only mode, the
+                                  default for this fork). Set to 99 to fully
+                                  offload every model that fits in VRAM.
   --split-mode <mode>            forwarded as --split-mode <mode>
-                                  (default: layer; "none" forces single-GPU,
-                                  even when SLURM allocated more)
+                                  (default: layer; only used when -ngl > 0;
+                                  "none" forces single-GPU)
   --tensor-split <a,b,...>       forwarded as --tensor-split <a,b,...>
-                                  (default: empty; e.g. "50,50" for 2 GPUs)
+                                  (default: empty; only used when -ngl > 0)
+  --cpu                         explicit CPU-only mode: sets -ngl 0 and
+                                skips CUDA build (equivalent to the
+                                defaults; provided for self-documentation
+                                in shell logs)
   --cuda                        enable CUDA build (passes -DGGML_CUDA=ON to cmake)
   --no-cuda                     disable CUDA build (default)
   --embeddings                  pass --embeddings to each eval binary
-                                (forces cparams.embeddings=true; default off
-                                because embedding=true triggers a CUDA
-                                illegal-memory-access bug on long multilingual
-                                prefills. The cb_eval hook still captures
-                                routing counts either way)
-  --no-embeddings               opposite of --embeddings (default)
+                                (forces cparams.embeddings=true; default ON
+                                for CPU because it prevents the
+                                `ggml_get_rows(cur, inp_out_ids)` collapse on
+                                the last layer. With embeddings=false the last
+                                MoE layer only routes 1 token per decode, so
+                                marginal counts for layer n_layer-1 are ~1/Q
+                                of the others. The CUDA illegal-memory-access
+                                bug that motivates embedding=false on GPUs
+                                does NOT trigger on CPU.)
+  --no-embeddings               opposite of --embeddings. Use this for A/B
+                                comparison against an existing GPU run.
+  --n-shots <N>                 few-shot exemplars drawn from each subject's
+                                (MMLU) or each (lang, domain)'s (INCLUDE) dev
+                                split. Forwarded as --n-shots N to the C++
+                                binary. Applies to mmlu + include only;
+                                popqa/bigbench/humaneval are generative and
+                                ignore this flag. Default = 5 for mmlu, 5
+                                for include (matches OLMoE's published
+                                MMLU 5-shot setup). Set to 0 for zero-shot.
+                                Use this to reproduce zero/one/few-shot
+                                ablation results without editing the
+                                per-dataset config_flags_for defaults.
   -h, --help                    show this message and exit
 
 Environment:
@@ -255,9 +302,12 @@ Environment:
   SPLIT_MODE=<mode>              equivalent to --split-mode <mode>
   EXTRA_TENSOR_SPLIT=<a,b,...>   equivalent to --tensor-split <a,b,...>
   EMBD=<0|1>                    equivalent to --embeddings/--no-embeddings
-                                 (default 0 = no embeddings; the safer mode
-                                 that avoids the CUDA OOB bug on long
-                                 multilingual prefills)
+                                 (default 1 = embeddings; the CPU-only mode
+                                 that avoids the last-layer collapse)
+  N_SHOTS=<N>                   equivalent to --n-shots <N>
+                                 (default <empty> = use the per-dataset
+                                 hardcoded default, currently 5 for mmlu
+                                 and 5 for include)
 
 The hardcoded MODELS list is at the top of the script (DEFAULT_MODELS).
 The default quantization is Q4_K_M (see QUANTS= at the top of the script).
@@ -311,6 +361,8 @@ parse_args() {
             --tensor-split)     EXTRA_TENSOR_SPLIT="$2"; shift 2 ;;
             --embeddings)       EMBD=1; shift ;;
             --no-embeddings)    EMBD=0; shift ;;
+            --cpu)              CPU_ONLY=1; USE_CUDA=0; NGL=0; shift ;;
+            --n-shots)          N_SHOTS="$2"; shift 2 ;;
             --cuda)             USE_CUDA=1; shift ;;
             --no-cuda)          USE_CUDA=0; shift ;;
             -h|--help)          PRINT_USAGE=1; shift ;;
@@ -533,31 +585,43 @@ run_eval() {
     # Compose C++ binary argv. --numa / -ngl / --split-mode /
     # --tensor-split are configurable from the env (NUMA_MODE / NGL /
     # SPLIT_MODE / EXTRA_TENSOR_SPLIT) so the spartan sbatch can tune
-    # them per partition. We always forward them (even with defaults)
-    # because llama.cpp's argument parser requires explicit values for
-    # --split-mode / --tensor-split to take effect; the defaults below
-    # are equivalent to "no-op" so it's safe to pass them unconditionally.
+    # them per partition.
+    #
+    # CPU-only branch (NGL=0, the default for this fork): we still pass
+    # -ngl 0 explicitly so the binary's argument parser doesn't trip on
+    # the missing flag, but we SKIP --split-mode and --tensor-split
+    # entirely because llama.cpp's argument parser requires them to take
+    # effect and they're a no-op when no GPU layers are offloaded. This
+    # also avoids the "GPU 0 not available" warning you'd otherwise get
+    # on a CPU-only build.
+    #
+    # GPU branch (NGL > 0): we always forward --numa / --split-mode and
+    # auto-derive --tensor-split so the multi-GPU case actually spreads
+    # layers instead of falling back to all-on-GPU-0.
     local -a BIN_FLAGS=( -hf "${model}:${quant}" "-ngl" "${NGL}" )
-    if [[ -n "${NUMA_MODE}" ]]; then
-        BIN_FLAGS+=( --numa "${NUMA_MODE}" )
-    fi
-    if [[ -n "${SPLIT_MODE}" ]]; then
-        BIN_FLAGS+=( --split-mode "${SPLIT_MODE}" )
-    fi
-    # Auto-derive --tensor-split when it's unset AND we're in a
-    # multi-GPU split mode. llama.cpp's own default is "auto-balance"
-    # which puts almost everything on GPU 0 for non-row/tensor splits;
-    # we make the explicit uniform split so all allocated GPUs get
-    # a fair share of layers.
-    if [[ -n "${EXTRA_TENSOR_SPLIT}" ]]; then
-        BIN_FLAGS+=( --tensor-split "${EXTRA_TENSOR_SPLIT}" )
-    elif [[ "${SPLIT_MODE}" == "layer" || "${SPLIT_MODE}" == "row" ]]; then
-        # We don't know n_gpu until the binary starts, so just pass a
-        # reasonable 2-way split (most common HPC config). The binary
-        # ignores extra fractions beyond n_gpu, so 50,50 is safe for
-        # both 2-GPU and 4-GPU boxes. Users on a 1-GPU box should set
-        # SPLIT_MODE=none (which skips this branch entirely).
-        BIN_FLAGS+=( --tensor-split "50,50" )
+    if [[ "${NGL}" -gt 0 ]]; then
+        if [[ -n "${NUMA_MODE}" ]]; then
+            BIN_FLAGS+=( --numa "${NUMA_MODE}" )
+        fi
+        if [[ -n "${SPLIT_MODE}" ]]; then
+            BIN_FLAGS+=( --split-mode "${SPLIT_MODE}" )
+        fi
+        if [[ -n "${EXTRA_TENSOR_SPLIT}" ]]; then
+            BIN_FLAGS+=( --tensor-split "${EXTRA_TENSOR_SPLIT}" )
+        elif [[ "${SPLIT_MODE}" == "layer" || "${SPLIT_MODE}" == "row" ]]; then
+            # We don't know n_gpu until the binary starts, so just pass a
+            # reasonable 2-way split (most common HPC config). The binary
+            # ignores extra fractions beyond n_gpu, so 50,50 is safe for
+            # both 2-GPU and 4-GPU boxes. Users on a 1-GPU box should set
+            # SPLIT_MODE=none (which skips this branch entirely).
+            BIN_FLAGS+=( --tensor-split "50,50" )
+        fi
+    else
+        # CPU-only mode: still forward --numa because that's a CPU-side
+        # scheduling knob, not a GPU-side one.
+        if [[ -n "${NUMA_MODE}" ]]; then
+            BIN_FLAGS+=( --numa "${NUMA_MODE}" )
+        fi
     fi
 
     # Embedding mode toggle. Default off (no embeddings, --no-embeddings
@@ -675,7 +739,7 @@ main() {
     _log_info "MODELS (${#MODELS[@]})       = ${MODELS[*]}"
     _log_info "DATASETS (${#DATASETS[@]})     = ${DATASETS[*]}"
     _log_info "QUANTS (${#QUANTS[@]})       = ${QUANTS[*]}"
-    _log_info "REBUILD=${REBUILD}, REDOWNLOAD=${REDOWNLOAD}, SKIP_PLOTS=${SKIP_PLOTS}, SKIP_ROUTING_GRAPHS=${SKIP_ROUTING_GRAPHS}, USE_CUDA=${USE_CUDA}, ROUTING_GRAPH_LINE_SCALE=${LINE_SCALE:-<default 5e-7>}, NUMA_MODE=${NUMA_MODE}, NGL=${NGL}, SPLIT_MODE=${SPLIT_MODE}, EXTRA_TENSOR_SPLIT=${EXTRA_TENSOR_SPLIT:-<unset>}, EMBD=${EMBD}"
+    _log_info "REBUILD=${REBUILD}, REDOWNLOAD=${REDOWNLOAD}, SKIP_PLOTS=${SKIP_PLOTS}, SKIP_ROUTING_GRAPHS=${SKIP_ROUTING_GRAPHS}, USE_CUDA=${USE_CUDA}, CPU_ONLY=${CPU_ONLY}, ROUTING_GRAPH_LINE_SCALE=${LINE_SCALE:-<default 5e-7>}, NUMA_MODE=${NUMA_MODE}, NGL=${NGL}, SPLIT_MODE=${SPLIT_MODE}, EXTRA_TENSOR_SPLIT=${EXTRA_TENSOR_SPLIT:-<unset>}, EMBD=${EMBD}, N_SHOTS=${N_SHOTS:-<default 5>}"
     echo "============================================================"
 
     echo "============================================================"

@@ -124,6 +124,24 @@ def load_aggregate(path: Path) -> dict:
         sys.exit(f"error: adjacent_pair_counts E-axes ({adj.shape[1:]}) != n_expert ({E})")
 
     k = int(arch.get("n_expert_used", 0))
+
+    # Per-layer minimum n_tokens observed across all decode calls (optional,
+    # absent in JSONs produced by older eval-moe-* binaries). Useful for
+    # prefill-only benchmarks (mmlu) where the last-layer ggml_get_rows
+    # collapse shrinks the layer from a few hundred prefill tokens down to
+    # 1. For GENERATIVE benchmarks (popqa/humaneval/bigbench) the min is
+    # 1 for ALL layers because every generated step is n_tokens=1, so the
+    # layer_min field alone can NOT tell the last layer from any other. We
+    # use it here only as supporting evidence; the primary collapse signal
+    # is the per-layer MARGINAL TOTAL (see _compute_collapse_note below).
+    layer_min = agg.get("layer_min_topk_n_tokens")
+    if layer_min is not None:
+        layer_min = list(layer_min)
+        if len(layer_min) != L:
+            layer_min = None  # shape mismatch — ignore
+    marginal_sum = np.asarray(marginal, dtype=np.int64).sum(axis=1).tolist()
+    collapse_note = _compute_collapse_note(marginal_sum, layer_min)
+
     return {
         "L": L,
         "E": E,
@@ -131,7 +149,109 @@ def load_aggregate(path: Path) -> dict:
         "arch": arch.get("name", "unknown"),
         "marginal": marginal,
         "adj": adj,
+        "layer_min_topk_n_tokens": layer_min,
+        "collapse_note": collapse_note,
     }
+
+
+def _compute_collapse_note(
+    marginal_per_layer_sum: list[int],
+    layer_min: list[int] | None = None,
+) -> str:
+    """Build a one-line title annotation listing collapsed / dense layers.
+
+    The PRIMARY signal is the per-layer marginal total
+    (`marginal_per_layer_sum`): a layer whose marginal is significantly
+    smaller than the median across layers (default threshold: 50%) was
+    evaluated with substantially fewer decode positions, almost always
+    because of the universal pattern
+
+        if (il == n_layer - 1 && inp_out_ids) cur = ggml_get_rows(cur, inp_out_ids);
+
+    in every model file (olmoe, deepseek2, openai-moe, llama, ...). That
+    shrinks the last layer to inp_out_ids.size() tokens per decode, so its
+    marginal scales linearly with the number of decodes (Q) while every
+    other layer scales linearly with prefill_length × k × Q (or, for
+    generative benchmarks, prefill_length × k × Q + decode_steps × k × Q).
+
+    `layer_min` (from `aggregate.layer_min_topk_n_tokens`) is used only as
+    supporting evidence. For prefill-only benchmarks it shows the same
+    collapse signature (1 vs ~600). For generative benchmarks it's always
+    1 for every layer, so by itself it cannot distinguish collapsed from
+    normal layers; the marginal-derived signal is then the source of truth.
+
+    The returned string is multi-line (a "\\nNote: ..." block) ready to be
+    appended to the matplotlib title.
+    """
+    if not marginal_per_layer_sum or len(marginal_per_layer_sum) == 0:
+        return ""
+
+    L = len(marginal_per_layer_sum)
+
+    # Use the median (not the max) as the reference so a single collapsed
+    # layer doesn't drag down the threshold. Zero marginals excluded.
+    non_zero = [v for v in marginal_per_layer_sum if v > 0]
+    if not non_zero:
+        return ""  # all layers have zero marginal — nothing useful to report
+    sorted_nz = sorted(non_zero)
+    median = sorted_nz[len(sorted_nz) // 2]
+    if median <= 0:
+        return ""
+
+    THRESHOLD_FRAC = 0.5
+    threshold = max(1, int(median * THRESHOLD_FRAC))
+
+    dense_layers: list[int] = []   # marginal == 0 (no MoE; cb never fired)
+    collapsed: list[tuple[int, float]] = []  # marginal > 0 but < threshold
+
+    for i, v in enumerate(marginal_per_layer_sum):
+        if v == 0:
+            dense_layers.append(i)
+        elif v < threshold:
+            collapsed.append((i, v / median))
+
+    if not dense_layers and not collapsed:
+        return ""  # all layers healthy
+    if len(dense_layers) == L:
+        return ""  # everything dense — no MoE evaluation happened
+
+    parts: list[str] = []
+    if dense_layers:
+        if len(dense_layers) <= 4:
+            parts.append("dense (no MoE): " + ", ".join(str(i) for i in dense_layers))
+        else:
+            parts.append(f"dense (no MoE): {len(dense_layers)} layers")
+
+    if collapsed:
+        # Sort by layer index for stable output.
+        collapsed.sort(key=lambda x: x[0])
+        if len(collapsed) <= 4:
+            collapsed_str = ", ".join(
+                f"L{i} ({ratio * 100:.1f}% of median)"
+                for i, ratio in collapsed
+            )
+            parts.append(f"collapsed: {collapsed_str}")
+        else:
+            parts.append(
+                f"collapsed: {len(collapsed)} layers "
+                f"(smallest {min(r for _, r in collapsed) * 100:.1f}% of median)"
+            )
+
+    # Add a hint about WHY when the collapsed layers are clustered at the
+    # end (typical ggml_get_rows last-layer-collapse fingerprint).
+    if collapsed:
+        collapsed_indices = [i for i, _ in collapsed]
+        n_at_end = sum(1 for i in collapsed_indices if i == L - 1 or i == L - 2)
+        hint = ""
+        if n_at_end and n_at_end == len(collapsed_indices):
+            hint = " (typically the last layer; ggml inp_out_ids shrinks it to n_outputs tokens)"
+        elif len(collapsed_indices) >= 2 and all(
+            i >= L - len(collapsed_indices) - 1 for i in collapsed_indices
+        ):
+            hint = " (likely last-layer ggml inp_out_ids collapse)"
+        parts[-1] = parts[-1] + hint
+
+    return "\nNote: " + "; ".join(parts)
 
 
 # ============================================================ simple grid layout
@@ -260,6 +380,7 @@ def draw_routing_graph(
     row_spacing: float,
     line_scale: float,
     path: Path,
+    collapse_note: str = "",
 ) -> None:
     """Render the integrated routing graph to `path`.
 
@@ -271,6 +392,12 @@ def draw_routing_graph(
     Lines connect top-K adjacent-layer (L, L+1) pairs by raw count; line
     thickness is proportional to raw count (no per-layer normalisation).
     A colourbar on the right encodes the marginal firing rate.
+
+    `collapse_note` is an optional multi-line text annotation appended to
+    the title. It typically lists layers that were evaluated with
+    substantially fewer tokens than the dataset's typical prefill (e.g.
+    the universal `ggml_get_rows(cur, inp_out_ids)` collapse on the last
+    layer of every MoE model). Empty string = no annotation.
     """
     L, E = marginal.shape
     pos = grid_positions(L, E, col_spacing, row_spacing)
@@ -391,11 +518,16 @@ def draw_routing_graph(
     cbar.ax.yaxis.set_major_formatter(FuncFormatter(millions_formatter))
 
     # ---- title ----
-    ax.set_title(
+    main_title = (
         f"Integrated routing graph ({L} layers × {E} experts, "
-        f"top {K} adjacent-layer pairs drawn)",
-        fontsize=11, pad=14,
+        f"top {K} adjacent-layer pairs drawn)"
     )
+    if collapse_note:
+        # Stack the collapse note under the main title so it stays attached
+        # to the figure but doesn't blow up the title font size. matplotlib
+        # inserts \n as a real newline in set_title() output.
+        main_title = main_title + collapse_note
+    ax.set_title(main_title, fontsize=11, pad=14)
 
     # ---- save ----
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -498,6 +630,16 @@ def main() -> None:
         highlight = [set() for _ in range(L)]
         print(f"[load] highlight disabled (--top-frac 0)")
 
+    # Per-layer token-collapse annotation (e.g. ggml_get_rows last-layer
+    # collapse). Empty when the source JSON doesn't carry the field (older
+    # eval-moe-* binaries) or when no layer is significantly smaller than
+    # the dataset's typical prefill length.
+    collapse_note = data.get("collapse_note", "")
+    if collapse_note:
+        # Surface the same note on stdout so headless users / CI logs can
+        # see it without opening the PNG.
+        print(collapse_note.strip().replace("\n", "  "))
+
     print(
         f"[draw] top-K={args.top_k} pairs/layer-pair, "
         f"col-spacing={args.col_spacing}, row-spacing={args.row_spacing}, "
@@ -512,6 +654,7 @@ def main() -> None:
         row_spacing=args.row_spacing,
         line_scale=args.line_scale,
         path=out_path,
+        collapse_note=collapse_note,
     )
     print(f"[save] {out_path}")
     print("[done]")

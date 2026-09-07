@@ -40,7 +40,8 @@
 // ------------------------------------------------------------------- tunables
 
 // Number of test questions to run per PopQA relation type.
-static constexpr int QUESTIONS_PER_PROP = 50;
+// Number of samples to run per PopQA relation type.
+static constexpr int N_SAMPLES = 9999999;
 
 // Number of generation tokens after prefill. Set to 0 to disable generation
 // entirely (prompt-only mode, useful for control experiments).
@@ -751,14 +752,14 @@ static void print_usage(int argc, char ** argv) {
             "      --props <path>          path to props.txt       (default: build/moe-popqa/props.txt)\n"
             "\n"
             "Run control:\n"
-            "      --questions-per-prop <N>   override QUESTIONS_PER_PROP (default %d)\n"
+            "      --n-samples <N>           override N_SAMPLES (default %d)\n"
             "      --gen-tokens <N>           autoregressive decode cap  (default %d, 0 = prompt-only)\n"
             "\n"
             "Output:\n"
             "  -o, --output <path>         output JSON (default: build/moe-popqa/expert_counts.json)\n"
             "\n"
             "Standard llama.cpp flags (from common_params_parse) are also accepted: -ngl, -c, --seed, etc.\n",
-            argv[0], QUESTIONS_PER_PROP, GEN_TOKENS);
+            argv[0], N_SAMPLES, GEN_TOKENS);
 }
 
 int main(int argc, char ** argv) {
@@ -766,11 +767,11 @@ int main(int argc, char ** argv) {
 
     // ----- custom args: extract from argv BEFORE common_params_parse so that
     // unknown flags don't trip its strict parser.
-    int         questions_per_prop = QUESTIONS_PER_PROP;
-    int         gen_tokens         = GEN_TOKENS;
-    std::string popqa_path         = "build/moe-popqa/popqa.jsonl";
-    std::string props_path         = "build/moe-popqa/props.txt";
-    std::string output_path        = "build/moe-popqa/expert_counts.json";
+    int         n_samples  = N_SAMPLES;
+    int         gen_tokens = GEN_TOKENS;
+    std::string popqa_path = "build/moe-popqa/popqa.jsonl";
+    std::string props_path = "build/moe-popqa/props.txt";
+    std::string output_path = "build/moe-popqa/expert_counts.json";
 
     // First pass: extract custom args.
     for (int i = 1; i < argc; ++i) {
@@ -786,8 +787,8 @@ int main(int argc, char ** argv) {
             popqa_path = next("path");
         } else if (a == "--props") {
             props_path = next("path");
-        } else if (a == "--questions-per-prop") {
-            questions_per_prop = std::stoi(next("N"));
+        } else if (a == "--n-samples") {
+            n_samples = std::stoi(next("N"));
         } else if (a == "--gen-tokens") {
             gen_tokens = std::stoi(next("N"));
         } else if (a == "-o" || a == "--output") {
@@ -805,7 +806,7 @@ int main(int argc, char ** argv) {
     filtered.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        if (a == "--popqa" || a == "--props" || a == "--questions-per-prop" || a == "--gen-tokens") {
+        if (a == "--popqa" || a == "--props" || a == "--n-samples" || a == "--gen-tokens") {
             ++i;  // skip value too
             continue;
         }
@@ -1005,7 +1006,7 @@ int main(int argc, char ** argv) {
             continue;
         }
         const auto & rows = prop_it->second;
-        const int    n_q  = std::min<int>(questions_per_prop, (int) rows.size());
+        const int    n_q  = std::min<int>(n_samples, (int) rows.size());
 
         LOG_INF("[%zu/%zu] %s - %d questions\n", pi + 1, props.size(), prop.c_str(), n_q);
 
@@ -1156,7 +1157,8 @@ int main(int argc, char ** argv) {
     std::fprintf(fout, "    \"n_expert_used\": %d\n", g_acc.n_expert_k);
     std::fprintf(fout, "  },\n");
     std::fprintf(fout, "  \"config\": {\n");
-    std::fprintf(fout, "    \"questions_per_prop\": %d,\n", questions_per_prop);
+    std::fprintf(fout, "    \"n_samples\": %d,\n", n_samples);
+        std::fprintf(fout, "    \"n_samples\": %d,\n", n_samples);
     std::fprintf(fout, "    \"gen_tokens\": %d,\n", gen_tokens);
     std::fprintf(fout, "    \"prompt_format\": \"zero_shot_qa\",\n");
     std::fprintf(fout, "    \"match_metric\": \"substring_normalized\"\n");

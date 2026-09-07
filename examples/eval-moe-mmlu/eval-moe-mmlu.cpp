@@ -35,7 +35,8 @@
 // ------------------------------------------------------------------- tunables
 
 // Number of test questions to run per MMLU subject. Change here and rebuild.
-static constexpr int QUERIES_PER_SUBJECT = 50;
+// Number of samples to run per MMLU subject.
+static constexpr int N_SAMPLES = 9999999;
 
 // Number of few-shot exemplars drawn from each subject's dev split. The OLMoE
 // authors evaluate MMLU 5-shot in their published numbers.
@@ -635,14 +636,14 @@ static void print_usage(int argc, char ** argv) {
             "      --subjects <path>       path to subjects.txt   (default: build/moe-mmlu/subjects.txt)\n"
             "\n"
             "Run control:\n"
-            "      --questions-per-subject <N>   override QUERIES_PER_SUBJECT (default %d)\n"
+            "      --n-samples <N>              override N_SAMPLES (default %d)\n"
             "      --n-shots <N>                override N_SHOT             (default %d)\n"
             "\n"
             "Output:\n"
             "  -o, --output <path>         output JSON (default: build/moe-mmlu/expert_counts.json)\n"
             "\n"
             "Standard llama.cpp flags (from common_params_parse) are also accepted: -ngl, -c, --seed, etc.\n",
-            argv[0], QUERIES_PER_SUBJECT, N_SHOT);
+            argv[0], N_SAMPLES, N_SHOT);
 }
 
 int main(int argc, char ** argv) {
@@ -650,11 +651,11 @@ int main(int argc, char ** argv) {
 
     // ----- custom args: extract from argv BEFORE common_params_parse so that
     // unknown flags don't trip its strict parser.
-    int         questions_per_subject = QUERIES_PER_SUBJECT;
-    int         n_shot                = N_SHOT;
-    std::string mmlu_path             = "build/moe-mmlu/mmlu.jsonl";
-    std::string subjects_path         = "build/moe-mmlu/subjects.txt";
-    std::string output_path           = "build/moe-mmlu/expert_counts.json";
+    int         n_samples   = N_SAMPLES;
+    int         n_shot      = N_SHOT;
+    std::string mmlu_path   = "build/moe-mmlu/mmlu.jsonl";
+    std::string subjects_path = "build/moe-mmlu/subjects.txt";
+    std::string output_path = "build/moe-mmlu/expert_counts.json";
 
     // First pass: extract custom args.
     for (int i = 1; i < argc; ++i) {
@@ -670,8 +671,8 @@ int main(int argc, char ** argv) {
             mmlu_path = next("path");
         } else if (a == "--subjects") {
             subjects_path = next("path");
-        } else if (a == "--questions-per-subject") {
-            questions_per_subject = std::stoi(next("N"));
+        } else if (a == "--n-samples") {
+            n_samples = std::stoi(next("N"));
         } else if (a == "--n-shots") {
             n_shot = std::stoi(next("N"));
         } else if (a == "-o" || a == "--output") {
@@ -689,7 +690,7 @@ int main(int argc, char ** argv) {
     filtered.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        if (a == "--mmlu" || a == "--subjects" || a == "--questions-per-subject" || a == "--n-shots") {
+        if (a == "--mmlu" || a == "--subjects" || a == "--n-samples" || a == "--n-shots") {
             ++i;  // skip value too
             continue;
         }
@@ -898,7 +899,7 @@ int main(int argc, char ** argv) {
         }
 
         const auto & test_rows = test_it->second;
-        const int    n_q       = std::min<int>(questions_per_subject, (int) test_rows.size());
+        const int    n_q       = std::min<int>(n_samples, (int) test_rows.size());
 
         LOG_INF("[%zu/%zu] %s - %d questions\n", si + 1, subjects.size(), subj.c_str(), n_q);
 
@@ -1034,7 +1035,7 @@ int main(int argc, char ** argv) {
     std::fprintf(fout, "    \"n_expert_used\": %d\n", g_acc.n_expert_k);
     std::fprintf(fout, "  },\n");
     std::fprintf(fout, "  \"config\": {\n");
-    std::fprintf(fout, "    \"questions_per_subject\": %d,\n", questions_per_subject);
+    std::fprintf(fout, "    \"n_samples\": %d,\n", n_samples);
     std::fprintf(fout, "    \"n_shot\": %d,\n", n_shot);
     std::fprintf(fout, "    \"few_shot_pool\": \"cais/mmlu dev split\",\n");
     std::fprintf(fout, "    \"prompt_format\": \"few_shot_chat\"\n");
@@ -1146,7 +1147,7 @@ int main(int argc, char ** argv) {
 
         std::fprintf(fout, "    \"%s\": {\n", json_escape(subj_name).c_str());
         std::fprintf(fout, "      \"questions\": %d,\n",
-                     (int) std::min<int64_t>(questions_per_subject, (int64_t) by_subject_test[subj_name].size()));
+                         (int) std::min<int64_t>(n_samples, (int64_t) by_subject_test[subj_name].size()));
         std::fprintf(fout, "      \"n_tokens\": %lld,\n", (long long) g_acc.tokens[subj_name]);
         std::fprintf(fout, "      \"layer_expert_counts\": ");
         write_json_2d_int_array(fout, layer_counts);

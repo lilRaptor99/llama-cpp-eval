@@ -60,7 +60,9 @@
 // Number of test questions to run per (language, domain) group, AFTER the
 // five exemplars are taken from the same bucket. With ~484 langdom groups
 // and the paper's 5-shot protocol the default is intentionally small.
-static constexpr int QUESTIONS_PER_LANGDOM = 5;
+// Number of samples to run per (language, domain) group, AFTER the five
+// exemplars are taken from the same bucket.
+static constexpr int N_SAMPLES = 9999999;
 
 // Number of few-shot exemplars drawn from each (lang, dom) test bucket.
 // The paper's canonical protocol (Romanou et al. 2024 §4.2) is 5-shot;
@@ -837,7 +839,7 @@ static void print_usage(int argc, char ** argv) {
             "build/moe-include/languages_domains.txt)\n"
             "\n"
             "Run control:\n"
-            "      --questions-per-langdom <N>   override QUESTIONS_PER_LANGDOM (default %d)\n"
+            "      --n-samples <N>           override N_SAMPLES (default %d)\n"
             "      --n-shots <N>                 override N_SHOT             (default %d, 0 = zero-shot)\n"
             "      --gen-tokens <N>              autoregressive decode cap   (default %d, 0 = prompt-only)\n"
             "\n"
@@ -845,7 +847,7 @@ static void print_usage(int argc, char ** argv) {
             "  -o, --output <path>         output JSON (default: build/moe-include/expert_counts.json)\n"
             "\n"
             "Standard llama.cpp flags (from common_params_parse) are also accepted: -ngl, -c, --seed, etc.\n",
-            argv[0], QUESTIONS_PER_LANGDOM, N_SHOT, GEN_TOKENS);
+            argv[0], N_SAMPLES, N_SHOT, GEN_TOKENS);
 }
 
 int main(int argc, char ** argv) {
@@ -853,12 +855,12 @@ int main(int argc, char ** argv) {
 
     // ----- custom args: extract from argv BEFORE common_params_parse so that
     // unknown flags don't trip its strict parser.
-    int         questions_per_langdom = QUESTIONS_PER_LANGDOM;
-    int         n_shot                = N_SHOT;
-    int         gen_tokens            = GEN_TOKENS;
-    std::string include_path          = "build/moe-include/include.jsonl";
-    std::string langdom_list_path     = "build/moe-include/languages_domains.txt";
-    std::string output_path           = "build/moe-include/expert_counts.json";
+    int         n_samples      = N_SAMPLES;
+    int         n_shot         = N_SHOT;
+    int         gen_tokens     = GEN_TOKENS;
+    std::string include_path   = "build/moe-include/include.jsonl";
+    std::string langdom_list_path = "build/moe-include/languages_domains.txt";
+    std::string output_path    = "build/moe-include/expert_counts.json";
 
     // First pass: extract custom args.
     for (int i = 1; i < argc; ++i) {
@@ -874,8 +876,8 @@ int main(int argc, char ** argv) {
             include_path = next("path");
         } else if (a == "--langdom-list") {
             langdom_list_path = next("path");
-        } else if (a == "--questions-per-langdom") {
-            questions_per_langdom = std::stoi(next("N"));
+        } else if (a == "--n-samples") {
+            n_samples = std::stoi(next("N"));
         } else if (a == "--n-shots") {
             n_shot = std::stoi(next("N"));
         } else if (a == "--gen-tokens") {
@@ -895,7 +897,7 @@ int main(int argc, char ** argv) {
     filtered.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        if (a == "--include" || a == "--langdom-list" || a == "--questions-per-langdom" || a == "--n-shots" ||
+        if (a == "--include" || a == "--langdom-list" || a == "--n-samples" || a == "--n-shots" ||
             a == "--gen-tokens") {
             ++i;  // skip value too
             continue;
@@ -1115,9 +1117,9 @@ int main(int argc, char ** argv) {
         const int    n_total     = (int) rows.size();
         const int    n_exemplars = std::min<int>(n_shot, n_total);
         // Reserve exemplars at the front; tests run from index n_exemplars
-        // onward. questions_per_langdom caps the number of test questions
+        // onward. n_samples caps the number of test questions
         // we ATTEMPT, not the available rows.
-        const int    n_q         = std::min<int>(questions_per_langdom, std::max(0, n_total - n_exemplars));
+        const int    n_q         = std::min<int>(n_samples, std::max(0, n_total - n_exemplars));
 
         std::vector<const include_row *> exemplars;
         exemplars.reserve(n_exemplars);
@@ -1287,7 +1289,8 @@ int main(int argc, char ** argv) {
     std::fprintf(fout, "    \"n_expert_used\": %d\n", g_acc.n_expert_k);
     std::fprintf(fout, "  },\n");
     std::fprintf(fout, "  \"config\": {\n");
-    std::fprintf(fout, "    \"questions_per_langdom\": %d,\n", questions_per_langdom);
+    std::fprintf(fout, "    \"n_samples\": %d,\n", n_samples);
+        std::fprintf(fout, "    \"n_samples\": %d,\n", n_samples);
     std::fprintf(fout, "    \"n_shot\": %d,\n", n_shot);
     std::fprintf(fout, "    \"gen_tokens\": %d,\n", gen_tokens);
     std::fprintf(fout, "    \"prompt_format\": \"few_shot_inlang_5shot\",\n");

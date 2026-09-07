@@ -45,8 +45,8 @@
 
 // ------------------------------------------------------------------- tunables
 
-// Number of test questions to run per BBH task config.
-static constexpr int QUESTIONS_PER_TASK = 50;
+// Number of samples to run per BBH task config.
+static constexpr int N_SAMPLES = 9999999;
 // Default for params.embedding. True reproduces the pre-patch behaviour
 // (and is needed when the downstream tool reads logits directly); false
 // captures routing-only via cb_eval without forcing output_all=true. See
@@ -678,14 +678,14 @@ static void print_usage(int argc, char ** argv) {
             "      --tasks <path>          path to tasks.txt       (default: build/moe-bigbench/tasks.txt)\n"
             "\n"
             "Run control:\n"
-            "      --questions-per-task <N>   override QUESTIONS_PER_TASK (default %d)\n"
+            "      --n-samples <N>           override N_SAMPLES (default %d)\n"
             "      --gen-tokens <N>           autoregressive decode cap  (default %d, 0 = prompt-only)\n"
             "\n"
             "Output:\n"
             "  -o, --output <path>         output JSON (default: build/moe-bigbench/expert_counts.json)\n"
             "\n"
             "Standard llama.cpp flags (from common_params_parse) are also accepted: -ngl, -c, --seed, etc.\n",
-            argv[0], QUESTIONS_PER_TASK, GEN_TOKENS);
+            argv[0], N_SAMPLES, GEN_TOKENS);
 }
 
 int main(int argc, char ** argv) {
@@ -693,11 +693,11 @@ int main(int argc, char ** argv) {
 
     // ----- custom args: extract from argv BEFORE common_params_parse so that
     // unknown flags don't trip its strict parser.
-    int         questions_per_task = QUESTIONS_PER_TASK;
-    int         gen_tokens         = GEN_TOKENS;
-    std::string bigbench_path      = "build/moe-bigbench/bigbench.jsonl";
-    std::string tasks_path         = "build/moe-bigbench/tasks.txt";
-    std::string output_path        = "build/moe-bigbench/expert_counts.json";
+    int         n_samples   = N_SAMPLES;
+    int         gen_tokens  = GEN_TOKENS;
+    std::string bigbench_path = "build/moe-bigbench/bigbench.jsonl";
+    std::string tasks_path    = "build/moe-bigbench/tasks.txt";
+    std::string output_path   = "build/moe-bigbench/expert_counts.json";
 
     // First pass: extract custom args.
     for (int i = 1; i < argc; ++i) {
@@ -713,8 +713,8 @@ int main(int argc, char ** argv) {
             bigbench_path = next("path");
         } else if (a == "--tasks") {
             tasks_path = next("path");
-        } else if (a == "--questions-per-task") {
-            questions_per_task = std::stoi(next("N"));
+        } else if (a == "--n-samples") {
+            n_samples = std::stoi(next("N"));
         } else if (a == "--gen-tokens") {
             gen_tokens = std::stoi(next("N"));
         } else if (a == "-o" || a == "--output") {
@@ -732,7 +732,7 @@ int main(int argc, char ** argv) {
     filtered.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        if (a == "--bigbench" || a == "--tasks" || a == "--questions-per-task" || a == "--gen-tokens") {
+        if (a == "--bigbench" || a == "--tasks" || a == "--n-samples" || a == "--gen-tokens") {
             ++i;  // skip value too
             continue;
         }
@@ -931,7 +931,7 @@ int main(int argc, char ** argv) {
             continue;
         }
         const auto & rows = task_it->second;
-        const int    n_q  = std::min<int>(questions_per_task, (int) rows.size());
+        const int    n_q  = std::min<int>(n_samples, (int) rows.size());
 
         LOG_INF("[%zu/%zu] %s - %d questions\n", ti + 1, tasks.size(), task.c_str(), n_q);
 
@@ -1088,7 +1088,7 @@ int main(int argc, char ** argv) {
     std::fprintf(fout, "    \"n_expert_used\": %d\n", g_acc.n_expert_k);
     std::fprintf(fout, "  },\n");
     std::fprintf(fout, "  \"config\": {\n");
-    std::fprintf(fout, "    \"questions_per_task\": %d,\n", questions_per_task);
+    std::fprintf(fout, "    \"n_samples\": %d,\n", n_samples);
     std::fprintf(fout, "    \"gen_tokens\": %d,\n", gen_tokens);
     std::fprintf(fout, "    \"prompt_format\": \"zero_shot_direct_qa\",\n");
     std::fprintf(fout, "    \"match_metric\": \"normalized_exact_match\"\n");

@@ -55,10 +55,10 @@
 
 // ------------------------------------------------------------------- tunables
 
-// Number of HumanEval problems to run per task_id. HumanEval only has 164
-// distinct task_ids, so this is effectively an upper bound; the binary
-// silently clamps to whatever is available.
-static constexpr int QUESTIONS_PER_TASK = 164;
+// Number of samples to run per task_id. HumanEval only has 164 distinct
+// task_ids, so this is effectively an upper bound; the binary silently
+// clamps to whatever is available.
+static constexpr int N_SAMPLES = 9999999;
 
 // Number of generation tokens after prefill. Set to 0 to disable
 // generation entirely (prompt-only mode, useful for control experiments).
@@ -588,7 +588,7 @@ static void print_usage(int argc, char ** argv) {
             "      --tasks <path>          path to tasks.txt       (default: build/moe-humaneval/tasks.txt)\n"
             "\n"
             "Run control:\n"
-            "      --questions-per-task <N>   override QUESTIONS_PER_TASK (default %d)\n"
+            "      --n-samples <N>           override N_SAMPLES (default %d)\n"
             "      --gen-tokens <N>           autoregressive decode cap  (default %d, 0 = prompt-only)\n"
             "\n"
             "Output:\n"
@@ -601,7 +601,7 @@ static void print_usage(int argc, char ** argv) {
             "comparison tooling.\n"
             "\n"
             "Standard llama.cpp flags (from common_params_parse) are also accepted: -ngl, -c, --seed, etc.\n",
-            argv[0], QUESTIONS_PER_TASK, GEN_TOKENS);
+            argv[0], N_SAMPLES, GEN_TOKENS);
 }
 
 // Best-effort mkdir -p (parents created if missing). Used before opening
@@ -631,11 +631,11 @@ int main(int argc, char ** argv) {
 
     // ----- custom args: extract from argv BEFORE common_params_parse so that
     // unknown flags don't trip its strict parser.
-    int         questions_per_task = QUESTIONS_PER_TASK;
-    int         gen_tokens         = GEN_TOKENS;
-    std::string humaneval_path     = "build/moe-humaneval/humaneval.jsonl";
-    std::string tasks_path         = "build/moe-humaneval/tasks.txt";
-    std::string output_path        = "build/moe-humaneval/expert_counts.json";
+    int         n_samples   = N_SAMPLES;
+    int         gen_tokens  = GEN_TOKENS;
+    std::string humaneval_path = "build/moe-humaneval/humaneval.jsonl";
+    std::string tasks_path    = "build/moe-humaneval/tasks.txt";
+    std::string output_path   = "build/moe-humaneval/expert_counts.json";
 
     // First pass: extract custom args.
     for (int i = 1; i < argc; ++i) {
@@ -651,8 +651,8 @@ int main(int argc, char ** argv) {
             humaneval_path = next("path");
         } else if (a == "--tasks") {
             tasks_path = next("path");
-        } else if (a == "--questions-per-task") {
-            questions_per_task = std::stoi(next("N"));
+        } else if (a == "--n-samples") {
+            n_samples = std::stoi(next("N"));
         } else if (a == "--gen-tokens") {
             gen_tokens = std::stoi(next("N"));
         } else if (a == "-o" || a == "--output") {
@@ -670,7 +670,7 @@ int main(int argc, char ** argv) {
     filtered.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        if (a == "--humaneval" || a == "--tasks" || a == "--questions-per-task" || a == "--gen-tokens") {
+        if (a == "--humaneval" || a == "--tasks" || a == "--n-samples" || a == "--gen-tokens") {
             ++i;  // skip value too
             continue;
         }
@@ -874,7 +874,7 @@ int main(int argc, char ** argv) {
             continue;
         }
         const humaneval_row & r   = *task_it->second;
-        const int             n_q = std::min<int>(questions_per_task, 1);  // HumanEval has at most 1 row per task_id
+        const int             n_q = std::min<int>(n_samples, 1);  // HumanEval has at most 1 row per task_id
 
         // Carry entry_point through to the output even if we skip the decode.
         g_acc.entry_point[task_id] = r.entry_point;
@@ -1042,7 +1042,7 @@ int main(int argc, char ** argv) {
     std::fprintf(fout, "    \"n_expert_used\": %d\n", g_acc.n_expert_k);
     std::fprintf(fout, "  },\n");
     std::fprintf(fout, "  \"config\": {\n");
-    std::fprintf(fout, "    \"questions_per_task\": %d,\n", questions_per_task);
+    std::fprintf(fout, "    \"n_samples\": %d,\n", n_samples);
     std::fprintf(fout, "    \"gen_tokens\": %d,\n", gen_tokens);
     std::fprintf(fout, "    \"prompt_format\": \"%s\",\n", "humaneval_zero_shot_continuation");
     std::fprintf(fout, "    \"match_metric\": \"%s\"\n", "none");

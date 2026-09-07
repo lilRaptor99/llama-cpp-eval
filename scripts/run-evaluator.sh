@@ -30,9 +30,9 @@ readonly REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # will download + cache the GGUF on first use.
 readonly DEFAULT_MODELS=(
     "allenai/OLMoE-1B-7B-0125-Instruct-GGUF"
-    "Lucy-in-the-Sky/deepseek-moe-16b-chat-Q8_0-GGUF"
-    #"mradermacher/deepseek-moe-16b-chat-i1-GGUF"
-    "unsloth/gpt-oss-120b-GGUF"
+    #"Lucy-in-the-Sky/deepseek-moe-16b-chat-Q8_0-GGUF"
+    "mradermacher/deepseek-moe-16b-chat-i1-GGUF"
+    #"unsloth/gpt-oss-120b-GGUF"
     "LiteLLMs/Mixtral-8x22B-Instruct-v0.1-GGUF"
 )
 
@@ -51,6 +51,9 @@ SKIP_ROUTING_GRAPHS=0
 USE_CUDA=0
 CPU_ONLY=0
 PRINT_USAGE=0
+# Cap on how many samples each dataset runner should consume. Set high
+# by default so the per-dataset CLI limit becomes effectively unbounded.
+N_SAMPLES="${N_SAMPLES:-9999999}"
 # Per-routing-graph --line-scale. Tune to match the magnitude of your
 # pair counts: OLMoE (~1e7 pair counts) wants ~1e-4, Mixtral (~1e6) wants
 # ~1e-5. Empty means use the wrapper default (5e-7).
@@ -162,6 +165,9 @@ routing_graph_for() {
 # Tweak per hardware budget - the values match the per-dataset README
 # "Quick smoke test" recommendations.
 #
+# N_SAMPLES override: when the global $N_SAMPLES env var (or --n-samples
+# CLI flag) is set, forward it to every dataset runner so they all see the
+# full dataset (default 9999999).
 # N_SHOTS override: when the global $N_SHOTS env var (or --n-shots CLI
 # flag) is set, override the --n-shots value for the datasets that
 # support it (mmlu, include). popqa/bigbench/humaneval are generative
@@ -171,19 +177,19 @@ config_flags_for() {
     case "$1" in
         mmlu)
             if [[ -n "${N_SHOTS}" ]]; then
-                printf -- '--questions-per-subject 100 --n-shots %s' "${N_SHOTS}"
+                printf -- '--n-samples %s --n-shots %s' "${N_SAMPLES}" "${N_SHOTS}"
             else
-                printf -- '--questions-per-subject 100 --n-shots 5'
+                printf -- '--n-samples %s --n-shots 5' "${N_SAMPLES}"
             fi
             ;;
-        popqa)    printf -- '--questions-per-prop 100 --gen-tokens 16' ;;
-        bigbench) printf -- '--questions-per-task 100 --gen-tokens 128' ;;
-        humaneval) printf -- '--questions-per-task 164 --gen-tokens 256' ;;
+        popqa)    printf -- '--n-samples %s --gen-tokens 16' "${N_SAMPLES}" ;;
+        bigbench) printf -- '--n-samples %s --gen-tokens 128' "${N_SAMPLES}" ;;
+        humaneval) printf -- '--n-samples %s --gen-tokens 256' "${N_SAMPLES}" ;;
         include)
             if [[ -n "${N_SHOTS}" ]]; then
-                printf -- '--questions-per-langdom 50 --n-shots %s --gen-tokens 16' "${N_SHOTS}"
+                printf -- '--n-samples %s --n-shots %s --gen-tokens 16' "${N_SAMPLES}" "${N_SHOTS}"
             else
-                printf -- '--questions-per-langdom 50 --n-shots 5 --gen-tokens 16'
+                printf -- '--n-samples %s --n-shots 5 --gen-tokens 16' "${N_SAMPLES}"
             fi
             ;;
         *) _die "config_flags_for: unknown dataset '$1'" ;;
@@ -249,6 +255,8 @@ Options:
   --skip-routing-graphs         skip routing_graph_from_cpp.py invocation
   --line-scale <float>          routing graph --line-scale override
                                 (default: 5e-7; tune to your pair count magnitude)
+    --n-samples <N>               sample cap forwarded to each dataset runner
+                                                                (default: 9999999)
   --numa <mode>                  forwarded as --numa <mode> to the C++ binary
                                   (default: isolate; try "distribute" or empty
                                   if you have NUMA-aware workload issues)
@@ -304,6 +312,8 @@ Environment:
   EMBD=<0|1>                    equivalent to --embeddings/--no-embeddings
                                  (default 1 = embeddings; the CPU-only mode
                                  that avoids the last-layer collapse)
+    N_SAMPLES=<N>                  equivalent to --n-samples <N>
+                                                                 (default 9999999 = all samples)
   N_SHOTS=<N>                   equivalent to --n-shots <N>
                                  (default <empty> = use the per-dataset
                                  hardcoded default, currently 5 for mmlu
@@ -355,6 +365,7 @@ parse_args() {
             --skip-plots)       SKIP_PLOTS=1; shift ;;
             --skip-routing-graphs)  SKIP_ROUTING_GRAPHS=1; shift ;;
             --line-scale)       LINE_SCALE="$2"; shift 2 ;;
+            --n-samples)        N_SAMPLES="$2"; shift 2 ;;
             --numa)             NUMA_MODE="$2"; shift 2 ;;
             --ngl)              NGL="$2"; shift 2 ;;
             --split-mode)       SPLIT_MODE="$2"; shift 2 ;;
@@ -739,7 +750,7 @@ main() {
     _log_info "MODELS (${#MODELS[@]})       = ${MODELS[*]}"
     _log_info "DATASETS (${#DATASETS[@]})     = ${DATASETS[*]}"
     _log_info "QUANTS (${#QUANTS[@]})       = ${QUANTS[*]}"
-    _log_info "REBUILD=${REBUILD}, REDOWNLOAD=${REDOWNLOAD}, SKIP_PLOTS=${SKIP_PLOTS}, SKIP_ROUTING_GRAPHS=${SKIP_ROUTING_GRAPHS}, USE_CUDA=${USE_CUDA}, CPU_ONLY=${CPU_ONLY}, ROUTING_GRAPH_LINE_SCALE=${LINE_SCALE:-<default 5e-7>}, NUMA_MODE=${NUMA_MODE}, NGL=${NGL}, SPLIT_MODE=${SPLIT_MODE}, EXTRA_TENSOR_SPLIT=${EXTRA_TENSOR_SPLIT:-<unset>}, EMBD=${EMBD}, N_SHOTS=${N_SHOTS:-<default 5>}"
+    _log_info "REBUILD=${REBUILD}, REDOWNLOAD=${REDOWNLOAD}, SKIP_PLOTS=${SKIP_PLOTS}, SKIP_ROUTING_GRAPHS=${SKIP_ROUTING_GRAPHS}, USE_CUDA=${USE_CUDA}, CPU_ONLY=${CPU_ONLY}, ROUTING_GRAPH_LINE_SCALE=${LINE_SCALE:-<default 5e-7>}, NUMA_MODE=${NUMA_MODE}, NGL=${NGL}, SPLIT_MODE=${SPLIT_MODE}, EXTRA_TENSOR_SPLIT=${EXTRA_TENSOR_SPLIT:-<unset>}, EMBD=${EMBD}, N_SAMPLES=${N_SAMPLES}, N_SHOTS=${N_SHOTS:-<default 5>}"
     echo "============================================================"
 
     echo "============================================================"

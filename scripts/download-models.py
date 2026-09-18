@@ -1,5 +1,13 @@
+import os
 import sys
+from pathlib import Path
+
 from huggingface_hub import snapshot_download
+
+HF_CACHE_DIR = Path("/mnt/data/huggingface")
+HF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+os.environ["HF_HOME"] = str(HF_CACHE_DIR)
+os.environ["HUGGINGFACE_HUB_CACHE"] = str(HF_CACHE_DIR)
 
 
 def main() -> int:
@@ -26,10 +34,12 @@ def main() -> int:
 
     print(f"  model: {model_id}", flush=True)
     print(f"  quant: {quant}", flush=True)
+    print(f"  cache_dir: {HF_CACHE_DIR}", flush=True)
     print(f"  allow_patterns: {allow_patterns}", flush=True)
     snapshot_download(
         repo_id=model_id,
         allow_patterns=allow_patterns,
+        cache_dir=str(HF_CACHE_DIR),
         tqdm_class=None,  # cleaner log output
     )
     print("  done", flush=True)

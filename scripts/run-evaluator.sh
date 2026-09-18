@@ -23,16 +23,19 @@ set -uo pipefail
 
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+HF_CACHE_DIR="${HF_CACHE_DIR:-/mnt/data/huggingface}"
+mkdir -p "${HF_CACHE_DIR}"
+export HF_HOME="${HF_HOME:-${HF_CACHE_DIR}}"
+export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-${HF_CACHE_DIR}}"
 
 # ------------------------------------------------------------- model list
 
 # Hardcoded HF MoE GGUF repos. Edit freely; each -hf <id> invocation
 # will download + cache the GGUF on first use.
 readonly DEFAULT_MODELS=(
+    #"unsloth/Qwen3-30B-A3B-GGUF"
     "allenai/OLMoE-1B-7B-0125-Instruct-GGUF"
-    #"Lucy-in-the-Sky/deepseek-moe-16b-chat-Q8_0-GGUF"
-    "mradermacher/deepseek-moe-16b-chat-i1-GGUF"
-    #"unsloth/gpt-oss-120b-GGUF"
+    "mradermacher/deepseek-moe-16b-chat-GGUF"
     "LiteLLMs/Mixtral-8x22B-Instruct-v0.1-GGUF"
 )
 
@@ -747,6 +750,8 @@ main() {
     _log_info "BUILD_DIR      = ${BUILD_DIR}"
     _log_info "DATASETS_DIR   = ${DATASETS_DIR}"
     _log_info "RESULTS_DIR    = ${RESULTS_DIR}"
+    _log_info "HF_HOME        = ${HF_HOME}"
+    _log_info "HUGGINGFACE_HUB_CACHE = ${HUGGINGFACE_HUB_CACHE}"
     _log_info "MODELS (${#MODELS[@]})       = ${MODELS[*]}"
     _log_info "DATASETS (${#DATASETS[@]})     = ${DATASETS[*]}"
     _log_info "QUANTS (${#QUANTS[@]})       = ${QUANTS[*]}"

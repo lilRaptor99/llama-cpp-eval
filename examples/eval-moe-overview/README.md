@@ -190,6 +190,7 @@ For each `<model_safe>/` the script writes
 | `jaccard_global.csv`        | Long-form: `K,layer,jaccard_union,jaccard_pairwise_mean` (single-number-per-(K, layer) view of cross-quant alignment).                                                     |
 | `jaccard_global.png`        | x = K, y = cross-quant Jaccard; thin per-layer lines + bold mean across layers; both union and pairwise-mean metrics overlaid for comparison.                              |
 | `README.json`               | Model id, arch, list of quants used, K values, totals, cross-quant alignment summary at K = n_expert_used.                                                                 |
+| `js_divergence_pairwise.png`| Layer-averaged Jensen-Shannon divergence heatmap across datasets, using the reversed Blues colormap so lower values are darker.                                           |
 
 ## Mathematical contract
 
@@ -197,9 +198,12 @@ For each layer `l` and K value, using the per-quant aggregated-across-
 datasets counts matrix from `counts_total_overview.json::counts_total`
 (shape `[L, E]`):
 
-```
-A_q_K[l]  = top-K experts in quant q, layer l
-            (descending count, ties -> ascending expert id)
+Identical to the cross-dataset version for the Jaccard heatmap: Blues
+colormap, `[black, white]` text-threshold rule at v = 0.55, aspect =
+auto, x/y tick labels rotated 30° for legibility. The new
+JS-divergence heatmap uses the reversed Blues colormap (`Blues_r`) so
+lower values are darker and the text threshold is flipped accordingly.
+For the cross-quant case the matrix is usually
 |∩|_K[l]  = |∩_q A_q_K[l]|              (intersection across quants)
 |∪|_K[l]  = |∪_q A_q_K[l]|              (union across quants)
 generalized Jaccard (strict consensus): |∩|_K[l] / |∪|_K[l]

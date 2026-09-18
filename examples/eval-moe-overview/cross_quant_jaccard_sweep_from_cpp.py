@@ -32,6 +32,9 @@ Outputs (under `<model-dir>/cross_quant_jaccard_sweep/`):
                                  (always present when E >= 2*K_model)
   - jaccard_pairwise_K3x.png     convenience alias for the 3*K_model heatmap
                                  (always present when E >= 3*K_model)
+    - js_divergence_pairwise.png   heatmap of layer-averaged Jensen-Shannon
+                                                                 divergence across quants; Blues_r colormap
+                                                                 so lower values are darker
   - jaccard_global.csv       long-form: K, layer, jaccard_union, jaccard_pairwise_mean
                              (single-number-per-(K, layer) view of cross-quant alignment)
   - jaccard_global.png       x = K, y = cross-quant Jaccard; thin per-layer lines
@@ -117,6 +120,7 @@ from jaccard_sweep_from_cpp import (  # noqa: E402
     _make_k_values,
     _jaccard,
     _generalized_jaccard,
+    _layer_averaged_js_divergence_matrix,
 )
 
 
@@ -440,6 +444,47 @@ def process_model(model_dir: Path, *, output_dir: Path | None = None,
                                 f"{mat[i, j]:.6f}\n")
     print(f"[save] {pair_csv_path}")
 
+    model_label = model_id or _reverse_model_safe(model_dir.name)
+
+    # -------- js_divergence_pairwise.png (heatmap of layer-averaged JS divergence)
+    js_pairwise = _layer_averaged_js_divergence_matrix(
+        [per_quant_counts[q] for q in quant_names_sorted]
+    )
+    js_fmt = "{v:.2e}" if float(np.max(js_pairwise)) < 0.01 else "{v:.2f}"
+    fig_w = max(5.5, N_q * 1.2 + 1.0)
+    fig_h = max(4.5, N_q * 1.0 + 0.8)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    im = ax.imshow(js_pairwise, vmin=0.0, vmax=1.0, cmap="Blues_r",
+                   aspect="auto")
+    ax.set_xticks(range(N_q))
+    ax.set_yticks(range(N_q))
+    ax.set_xticklabels(quant_names_sorted, rotation=30, ha="right",
+                       fontsize=8)
+    ax.set_yticklabels(quant_names_sorted, fontsize=8)
+    ax.set_xlabel("quant")
+    ax.set_ylabel("quant")
+    for i in range(N_q):
+        for j in range(N_q):
+            v = js_pairwise[i, j]
+            # Reversed Blues: low divergence is dark, so white text reads
+            # better on the darker cells.
+            color = "white" if v < 0.55 else "black"
+            ax.text(j, i, js_fmt.format(v=v), ha="center", va="center",
+                    fontsize=9, color=color)
+    ax.set_title(
+        f"{model_label}  -  layer-averaged Jensen-Shannon divergence ({arch['name']})\n"
+        f"L={L} E={E}; averaged across {L} layer(s); {N_q} quants",
+        fontsize=10,
+    )
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_ticks(np.linspace(0.0, 1.0, 6))
+    cbar.set_label("layer-averaged Jensen-Shannon divergence", fontsize=8)
+    fig.tight_layout()
+    js_png = output_dir / "js_divergence_pairwise.png"
+    fig.savefig(js_png, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[save] {js_png}")
+
     global_csv_path = output_dir / "jaccard_global.csv"
     with open(global_csv_path, "w") as f:
         f.write("K,layer,jaccard_union,jaccard_pairwise_mean\n")
@@ -453,7 +498,6 @@ def process_model(model_dir: Path, *, output_dir: Path | None = None,
     # -------- README.json (meta)
     gj_at_kmodel = float(np.mean(jaccard_union[K_model]))
     mp_at_kmodel = float(np.mean(jaccard_pairwise_mean[K_model]))
-    model_label = model_id or _reverse_model_safe(model_dir.name)
     meta = {
         "model_dir": str(model_dir),
         "model_id": model_label,

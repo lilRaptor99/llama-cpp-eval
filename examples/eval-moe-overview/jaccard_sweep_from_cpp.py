@@ -25,6 +25,9 @@ Outputs (under `<cell-dir>/jaccard_sweep/`):
                                  (always present when E >= 2*K_model)
   - jaccard_pairwise_K3x.png     convenience alias for the 3*K_model heatmap
                                  (always present when E >= 3*K_model)
+    - js_divergence_pairwise.png   heatmap of layer-averaged Jensen-Shannon
+                                                                 divergence across datasets; Blues_r colormap
+                                                                 so lower values are darker
   - jaccard_global.csv       long-form: K, layer, jaccard_union, jaccard_pairwise_mean
                              (single-number-per-(K, layer) view of cross-dataset alignment)
   - jaccard_global.png       x = K, y = cross-dataset Jaccard; thin per-layer lines
@@ -214,6 +217,52 @@ def _generalized_jaccard(sets_list: list[set[int]]) -> float:
     if not union:
         return 1.0
     return len(inter) / len(union)
+
+
+def _jensen_shannon_divergence(a: np.ndarray, b: np.ndarray) -> float:
+    """Jensen-Shannon divergence between two non-negative count vectors.
+
+    The result is normalized with log base 2, so it lies in [0, 1] for
+    probability distributions. Empty-vs-empty is treated as 0.0 and
+    empty-vs-non-empty as 1.0 for a stable heatmap scale.
+    """
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    sum_a = float(a.sum())
+    sum_b = float(b.sum())
+    if sum_a <= 0.0 and sum_b <= 0.0:
+        return 0.0
+    if sum_a <= 0.0 or sum_b <= 0.0:
+        return 1.0
+
+    p = a / sum_a
+    q = b / sum_b
+    m = 0.5 * (p + q)
+
+    mask_p = p > 0
+    mask_q = q > 0
+    kl_pm = float(np.sum(p[mask_p] * np.log2(p[mask_p] / m[mask_p])))
+    kl_qm = float(np.sum(q[mask_q] * np.log2(q[mask_q] / m[mask_q])))
+    return 0.5 * (kl_pm + kl_qm)
+
+
+def _layer_averaged_js_divergence_matrix(
+        counts_list: list[np.ndarray]) -> np.ndarray:
+    """Return the pairwise layer-averaged JS divergence matrix."""
+    n_items = len(counts_list)
+    if n_items == 0:
+        return np.zeros((0, 0), dtype=np.float64)
+    n_layers = int(counts_list[0].shape[0])
+    out = np.zeros((n_items, n_items), dtype=np.float64)
+    for i in range(n_items):
+        for j in range(i, n_items):
+            vals = [
+                _jensen_shannon_divergence(counts_list[i][layer],
+                                           counts_list[j][layer])
+                for layer in range(n_layers)
+            ]
+            out[i, j] = out[j, i] = float(np.mean(vals)) if vals else 0.0
+    return out
 
 
 # --------------------------------------------------------------- core
@@ -455,6 +504,42 @@ def process_cell(cell_dir: Path, *, output_dir: Path | None = None,
                                 f"{ds_names_sorted[j]},"
                                 f"{mat[i, j]:.6f}\n")
     print(f"[save] {pair_csv_path}")
+
+    # -------- js_divergence_pairwise.png (heatmap of layer-averaged JS divergence)
+    js_pairwise = _layer_averaged_js_divergence_matrix(
+        [per_ds_counts[ds] for ds in ds_names_sorted]
+    )
+    fig_w = max(5.5, N_ds * 1.2 + 1.0)
+    fig_h = max(4.5, N_ds * 1.0 + 0.8)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    im = ax.imshow(js_pairwise, vmin=0.0, vmax=1.0, cmap="Blues_r",
+                   aspect="auto")
+    ax.set_xticks(range(N_ds))
+    ax.set_yticks(range(N_ds))
+    ax.set_xticklabels(ds_names_sorted, rotation=30, ha="right", fontsize=8)
+    ax.set_yticklabels(ds_names_sorted, fontsize=8)
+    ax.set_xlabel("dataset")
+    ax.set_ylabel("dataset")
+    for i in range(N_ds):
+        for j in range(N_ds):
+            v = js_pairwise[i, j]
+            # Reversed Blues: low divergence is dark, so white text is
+            # easier to read on the darker cells.
+            color = "white" if v < 0.55 else "black"
+            ax.text(j, i, f"{v:.2f}", ha="center", va="center",
+                    fontsize=9, color=color)
+    ax.set_title(
+        f"{model_id or cell_dir.parent.name}  -  layer-averaged Jensen-Shannon divergence\n"
+        f"{arch['name']} L={L} E={E}; averaged across {L} layer(s); {N_ds} datasets",
+        fontsize=10,
+    )
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("layer-averaged Jensen-Shannon divergence", fontsize=8)
+    fig.tight_layout()
+    js_png = output_dir / "js_divergence_pairwise.png"
+    fig.savefig(js_png, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[save] {js_png}")
 
     global_csv_path = output_dir / "jaccard_global.csv"
     with open(global_csv_path, "w") as f:

@@ -33,6 +33,7 @@
 #include "common.h"
 #include "llama.h"
 #include "log.h"
+#include "../_shared/moe_random_router.h"
 
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -70,6 +71,8 @@ static constexpr int GEN_TOKENS        = 256;
 // Default for params.embedding. See comment at params.embedding below.
 // Overridable via --embeddings / --no-embeddings CLI flag.
 static bool          g_embeddings_mode = false;
+static bool          g_random_router   = false;
+static uint64_t      g_random_seed     = 0;
 
 // Default sampling: greedy, deterministic. Matches the canonical HumanEval
 // paper protocol (Chen et al., 2021, "Evaluating Large Language Models
@@ -144,6 +147,8 @@ struct moe_accumulator {
 
     // expose shape on first capture so we can validate later tensors
     int seen_k = -1;
+
+    moe_random_router_state random_router;
 };
 
 static moe_accumulator g_acc;
@@ -203,7 +208,11 @@ static bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data
     GGML_ASSERT(stride0 == 1 && "expected contiguous ints along axis 0");
     const size_t         buf_elems = (size_t) ntok * stride1;
     std::vector<int32_t> buf(buf_elems);
-    ggml_backend_tensor_get(t, buf.data(), 0, ggml_nbytes(t));
+    if (g_acc.random_router.enabled) {
+        g_acc.random_router.fill_topk_buffer(ntok, g_acc.n_expert_k, buf.data());
+    } else {
+        ggml_backend_tensor_get(t, buf.data(), 0, ggml_nbytes(t));
+    }
 
     auto & layer_counts = g_acc.counts[g_acc.current_task_id][il];
     for (int tok = 0; tok < ntok; ++tok) {
@@ -590,6 +599,8 @@ static void print_usage(int argc, char ** argv) {
             "Run control:\n"
             "      --n-samples <N>           override N_SAMPLES (default %d)\n"
             "      --gen-tokens <N>           autoregressive decode cap  (default %d, 0 = prompt-only)\n"
+            "      --random-router              replace routed experts with uniform random samples\n"
+            "      --random-seed <N>            seed for random-router mode (default 0)\n"
             "\n"
             "Output:\n"
             "  -o, --output <path>         output JSON (default: build/moe-humaneval/expert_counts.json)\n"
@@ -655,6 +666,10 @@ int main(int argc, char ** argv) {
             n_samples = std::stoi(next("N"));
         } else if (a == "--gen-tokens") {
             gen_tokens = std::stoi(next("N"));
+        } else if (a == "--random-router") {
+            g_random_router = true;
+        } else if (a == "--random-seed") {
+            g_random_seed = (uint64_t) std::stoull(next("N"));
         } else if (a == "-o" || a == "--output") {
             output_path = next("path");
         } else if (a == "--embeddings") {
@@ -670,8 +685,12 @@ int main(int argc, char ** argv) {
     filtered.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        if (a == "--humaneval" || a == "--tasks" || a == "--n-samples" || a == "--gen-tokens") {
+        if (a == "--humaneval" || a == "--tasks" || a == "--n-samples" || a == "--gen-tokens" ||
+            a == "--random-seed") {
             ++i;  // skip value too
+            continue;
+        }
+        if (a == "--random-router") {
             continue;
         }
         if (a == "-o" || a == "--output") {
@@ -825,6 +844,11 @@ int main(int argc, char ** argv) {
     g_acc.n_expert_k = n_expert_k_meta;
     LOG_INF("model n_expert = %d, n_expert_used = %d\n", g_acc.n_expert, g_acc.n_expert_k);
 
+    g_acc.random_router.enabled = g_random_router;
+    g_acc.random_router.configure(g_acc.n_expert, g_random_seed);
+    LOG_INF("random router mode = %s (seed=%llu)\n", g_acc.random_router.enabled ? "on" : "off",
+            (unsigned long long) g_random_seed);
+
     // Print system info
     LOG_INF("%s\n", common_params_get_system_info(params).c_str());
 
@@ -867,6 +891,9 @@ int main(int argc, char ** argv) {
     for (size_t ti = 0; ti < tasks.size(); ++ti) {
         const std::string & task_id = tasks[ti];
         g_acc.current_task_id       = task_id;
+        if (g_acc.random_router.enabled) {
+            g_acc.random_router.seed_subject(params.model.get_name(), g_acc.arch, task_id);
+        }
 
         const auto & task_it = by_task_id.find(task_id);
         if (task_it == by_task_id.end() || task_it->second == nullptr) {

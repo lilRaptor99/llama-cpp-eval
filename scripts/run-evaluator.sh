@@ -34,6 +34,7 @@ export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-${HF_CACHE_DIR}}"
 # will download + cache the GGUF on first use.
 readonly DEFAULT_MODELS=(
     #"unsloth/Qwen3-30B-A3B-GGUF"
+    #"mradermacher/OLMoE-1B-7B-0924-Instruct-GGUF"
     "allenai/OLMoE-1B-7B-0125-Instruct-GGUF"
     "mradermacher/deepseek-moe-16b-chat-GGUF"
     "LiteLLMs/Mixtral-8x22B-Instruct-v0.1-GGUF"
@@ -54,6 +55,16 @@ SKIP_ROUTING_GRAPHS=0
 USE_CUDA=0
 CPU_ONLY=0
 PRINT_USAGE=0
+# Random router baseline mode (replaces expert selections in each
+# llama_decode callback with uniform random samples over the available
+# experts). When RANDOM_ROUTER=1, results are written under a `random/`
+# subdir of every (model, quant, dataset) cell so real and random runs
+# coexist without collision. RANDOM_SEED is an optional uint64_t seed
+# forwarded to the eval binary; the env form is RANDOM_SEED=42. Empty
+# default means "let the binary pick its own base seed" (the binary
+# uses the model's metadata for the seed).
+RANDOM_ROUTER=0
+RANDOM_SEED=""
 # Cap on how many samples each dataset runner should consume. Set high
 # by default so the per-dataset CLI limit becomes effectively unbounded.
 N_SAMPLES="${N_SAMPLES:-9999999}"
@@ -290,6 +301,18 @@ Options:
                                 does NOT trigger on CPU.)
   --no-embeddings               opposite of --embeddings. Use this for A/B
                                 comparison against an existing GPU run.
+  --random-router               run the random-router baseline (replaces
+                                routed experts with uniform random
+                                samples). Writes outputs under
+                                <cell>/random/expert_counts.json so
+                                real and random runs do not collide.
+                                Forwarded to every eval binary as
+                                `--random-router`. Pair with
+                                `--random-seed <N>` for reproducibility.
+  --random-seed <N>             seed for the random-router baseline,
+                                forwarded as `--random-seed <N>`. Use
+                                the same N across reruns to get
+                                bit-identical outputs.
   --n-shots <N>                 few-shot exemplars drawn from each subject's
                                 (MMLU) or each (lang, domain)'s (INCLUDE) dev
                                 split. Forwarded as --n-shots N to the C++
@@ -303,7 +326,9 @@ Options:
                                 per-dataset config_flags_for defaults.
   -h, --help                    show this message and exit
 
-Environment:
+EnRANDOM_ROUTER=<0|1>            equivalent to --random-router
+  RANDOM_SEED=<N>                equivalent to --random-seed <N>
+  vironment:
   EXTRA_CMAKE_FLAGS="..."        extra arguments forwarded to cmake configure
   CUDA_ARCHITECTURES="80;89"     forwarded as -DCMAKE_CUDA_ARCHITECTURES=<...>
                                  (only used when --cuda is set)
@@ -371,6 +396,16 @@ parse_args() {
             --n-samples)        N_SAMPLES="$2"; shift 2 ;;
             --numa)             NUMA_MODE="$2"; shift 2 ;;
             --ngl)              NGL="$2"; shift 2 ;;
+            --split-mode)       SPLIT_MODE="$2"; shift 2 ;;
+            --tensor-split)     EXTRA_TENSOR_SPLIT="$2"; shift 2 ;;
+            --embeddings)       EMBD=1; shift ;;
+            --no-embeddings)    EMBD=0; shift ;;
+            --cpu)              CPU_ONLY=1; USE_CUDA=0; NGL=0; shift ;;
+            --n-shots)          N_SHOTS="$2"; shift 2 ;;
+            --cuda)             USE_CUDA=1; shift ;;
+            --no-cuda)          USE_CUDA=0; shift ;;
+            --random-router)    RANDOM_ROUTER=1; shift ;;
+            --random-seed)      RANDOM_SEED="$2"; shift 2 ;;
             --split-mode)       SPLIT_MODE="$2"; shift 2 ;;
             --tensor-split)     EXTRA_TENSOR_SPLIT="$2"; shift 2 ;;
             --embeddings)       EMBD=1; shift ;;
@@ -562,18 +597,27 @@ run_eval() {
     local safe;       safe="$(model_safe "$model")"
     local quant_safe; quant_safe="$(quant_safe "$quant")"
     local out_dir="${RESULTS_DIR}/${safe}/${quant_safe}/moe-${ds}"
+    # When the random-router baseline is enabled, route outputs to a
+    # dedicated `random/` subdir so real and random runs coexist
+    # in-place. The plot / routing-graph steps below then operate on
+    # the random/expert_counts.json without touching the real one.
+    local mode_tag=""
+    if [[ $RANDOM_ROUTER -eq 1 ]]; then
+        out_dir="${out_dir}/random"
+        mode_tag="[random] "
+    fi
     local log="${out_dir}/run.log"
     local plot_log="${out_dir}/plot.log"
     local routing_log="${out_dir}/routing.log"
     local json="${out_dir}/expert_counts.json"
     local binary; binary="$(binary_for "$ds")"
-    local status_key="${model}|${quant}|${ds}"
+    local status_key="${model}|${quant}|${ds}|random"
 
     mkdir -p "$out_dir"
 
     if [[ $REDOWNLOAD -eq 0 && -f "$json" ]]; then
         if json_is_valid "$json"; then
-        _log_info "(model=${model}, quant=${quant}, ds=${ds}) -> SKIPPED (${json} exists)"
+        _log_info "${mode_tag}(model=${model}, quant=${quant}, ds=${ds}) -> SKIPPED (${json} exists)"
         STATUS["${status_key}"]="SKIPPED"
         # The C++ step was skipped, but the derived artifacts may still
         # be missing on first run (or stale from a previous tool version).
@@ -583,10 +627,10 @@ run_eval() {
         _render_routing_graph "$model" "$quant" "$ds" "$json" "$routing_log"
         return 0
         fi
-        _log_warn "(model=${model}, quant=${quant}, ds=${ds}) existing ${json} is invalid; regenerating"
+        _log_warn "${mode_tag}(model=${model}, quant=${quant}, ds=${ds}) existing ${json} is invalid; regenerating"
     fi
 
-    _log_info "(model=${model}, quant=${quant}, ds=${ds}) running ${binary##*/} ..."
+    _log_info "${mode_tag}(model=${model}, quant=${quant}, ds=${ds}) running ${binary##*/} ..."
 
     # Build argv tokens for the dataset-specific flags. We use `read -r -a`
     # to split on whitespace so the output of config_flags_for /
@@ -649,6 +693,19 @@ run_eval() {
         BIN_FLAGS+=( --no-embeddings )
     fi
 
+    # Random-router baseline mode. When enabled, the eval binary replaces
+    # every per-token expert selection with a uniform random sample over
+    # the model's available experts, deterministically seeded by
+    # RANDOM_SEED (and the model + subject inside the binary). Pass the
+    # same RANDOM_SEED across reruns to get bit-identical baseline
+    # outputs that can be diffed against normal runs.
+    if [[ $RANDOM_ROUTER -eq 1 ]]; then
+        BIN_FLAGS+=( --random-router )
+        if [[ -n "${RANDOM_SEED}" ]]; then
+            BIN_FLAGS+=( --random-seed "${RANDOM_SEED}" )
+        fi
+    fi
+
     if "${binary}" "${BIN_FLAGS[@]}" \
             "${CF_FLAGS[@]}" "${DS_FLAGS[@]}" \
             -o "$json" \
@@ -656,16 +713,16 @@ run_eval() {
         : # success
     else
         local rc=$?
-        _log_err "(model=${model}, quant=${quant}, ds=${ds}) FAILED (rc=${rc}); log: ${log}"
+        _log_err "${mode_tag}(model=${model}, quant=${quant}, ds=${ds}) FAILED (rc=${rc}); log: ${log}"
         STATUS["${status_key}"]="FAILED|${log}"
         return 0
     fi
 
     if [[ -f "$json" ]]; then
-        _log_info "(model=${model}, quant=${quant}, ds=${ds}) -> OK (json=${json})"
+        _log_info "${mode_tag}(model=${model}, quant=${quant}, ds=${ds}) -> OK (json=${json})"
         STATUS["${status_key}"]="OK"
     else
-        _log_warn "(model=${model}, quant=${quant}, ds=${ds}) exit=0 but ${json} missing; FAILED"
+        _log_warn "${mode_tag}(model=${model}, quant=${quant}, ds=${ds}) exit=0 but ${json} missing; FAILED"
         STATUS["${status_key}"]="FAILED|${log}"
         return 0
     fi
@@ -708,23 +765,33 @@ _render_routing_graph() {
 print_summary() {
     echo
     echo "=== summary ==="
-    printf '%-72s  %-10s  %s\n' "model | quant | dataset" "status" "log_path"
-    printf '%-72s  %-10s  %s\n' "------------------------------------------------------------------------" "------" "--------"
-    local m q ds safe qsafe key status log
+    printf '%-90s  %-10s  %s\n' "model | quant | dataset | mode" "status" "log_path"
+    printf '%-90s  %-10s  %s\n' "--------------------------------------------------------------------------------------------------------------------------" "------" "--------"
+    local m q ds safe qsafe key status log mode
+    # Active mode tags: print the real-cell row first when a random-cell
+    # row was also recorded, so the table shows both side by side.
+    local modes=("real")
+    [[ $RANDOM_ROUTER -eq 1 ]] && modes+=("random")
     for m in "${MODELS[@]}"; do
         safe="$(model_safe "$m")"
         for q in "${QUANTS[@]}"; do
             qsafe="$(quant_safe "$q")"
             for ds in "${DATASETS[@]}"; do
-                key="${m}|${q}|${ds}"
-                status="${STATUS[$key]:-MISSING}"
-                case "$status" in
-                    OK)        log="${RESULTS_DIR}/${safe}/${qsafe}/moe-${ds}/run.log" ;;
-                    SKIPPED)   log="${RESULTS_DIR}/${safe}/${qsafe}/moe-${ds}/expert_counts.json" ;;
-                    FAILED*)   log="${status#FAILED|}" ;;
-                    *)         log="(no record)" ;;
-                esac
-                printf '%-72s  %-10s  %s\n' "${key}" "${status%%|*}" "${log}"
+                for mode in "${modes[@]}"; do
+                    if [[ "$mode" == "random" ]]; then
+                        key="${m}|${q}|${ds}|random"
+                    else
+                        key="${m}|${q}|${ds}"
+                    fi
+                    status="${STATUS[$key]:-MISSING}"
+                    case "$status" in
+                        OK)        log="${RESULTS_DIR}/${safe}/${qsafe}/moe-${ds}/$([ "$mode" == "random" ] && echo random || echo '')/run.log" ;;
+                        SKIPPED)   log="${RESULTS_DIR}/${safe}/${qsafe}/moe-${ds}/$([ "$mode" == "random" ] && echo random || echo '')/expert_counts.json" ;;
+                        FAILED*)   log="${status#FAILED|}" ;;
+                        *)         log="(no record)" ;;
+                    esac
+                    printf '%-90s  %-10s  %s\n' "${m}|${q}|${ds}|${mode}" "${status%%|*}" "${log}"
+                done
             done
         done
     done
@@ -755,7 +822,7 @@ main() {
     _log_info "MODELS (${#MODELS[@]})       = ${MODELS[*]}"
     _log_info "DATASETS (${#DATASETS[@]})     = ${DATASETS[*]}"
     _log_info "QUANTS (${#QUANTS[@]})       = ${QUANTS[*]}"
-    _log_info "REBUILD=${REBUILD}, REDOWNLOAD=${REDOWNLOAD}, SKIP_PLOTS=${SKIP_PLOTS}, SKIP_ROUTING_GRAPHS=${SKIP_ROUTING_GRAPHS}, USE_CUDA=${USE_CUDA}, CPU_ONLY=${CPU_ONLY}, ROUTING_GRAPH_LINE_SCALE=${LINE_SCALE:-<default 5e-7>}, NUMA_MODE=${NUMA_MODE}, NGL=${NGL}, SPLIT_MODE=${SPLIT_MODE}, EXTRA_TENSOR_SPLIT=${EXTRA_TENSOR_SPLIT:-<unset>}, EMBD=${EMBD}, N_SAMPLES=${N_SAMPLES}, N_SHOTS=${N_SHOTS:-<default 5>}"
+    _log_info "REBUILD=${REBUILD}, REDOWNLOAD=${REDOWNLOAD}, SKIP_PLOTS=${SKIP_PLOTS}, SKIP_ROUTING_GRAPHS=${SKIP_ROUTING_GRAPHS}, USE_CUDA=${USE_CUDA}, CPU_ONLY=${CPU_ONLY}, ROUTING_GRAPH_LINE_SCALE=${LINE_SCALE:-<default 5e-7>}, NUMA_MODE=${NUMA_MODE}, NGL=${NGL}, SPLIT_MODE=${SPLIT_MODE}, EXTRA_TENSOR_SPLIT=${EXTRA_TENSOR_SPLIT:-<unset>}, EMBD=${EMBD}, RANDOM_ROUTER=${RANDOM_ROUTER}, RANDOM_SEED=${RANDOM_SEED:-<unset>}, N_SAMPLES=${N_SAMPLES}, N_SHOTS=${N_SHOTS:-<default 5>}"
     echo "============================================================"
 
     echo "============================================================"
@@ -785,6 +852,8 @@ main() {
             done
         done
     done
+
+    print_summary
 
     echo "results root: ${RESULTS_DIR}"
 }

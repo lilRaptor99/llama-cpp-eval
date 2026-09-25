@@ -29,6 +29,7 @@
 #include "common.h"
 #include "llama.h"
 #include "log.h"
+#include "../_shared/moe_random_router.h"
 
 #include <algorithm>
 #include <cctype>
@@ -158,6 +159,8 @@ struct moe_accumulator {
     int  sparse_min_count  = SPARSE_MIN_COUNT_DEFAULT;  // 0 = dense; >0 = COO sparse
 
     int seen_k = -1;
+
+    moe_random_router_state random_router;
 };
 
 static moe_accumulator g_acc;
@@ -231,7 +234,11 @@ static bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data
 
     const size_t         buf_elems = (size_t) ntok * stride1;
     std::vector<int32_t> buf(buf_elems);
-    ggml_backend_tensor_get(t, buf.data(), 0, ggml_nbytes(t));
+    if (g_acc.random_router.enabled) {
+        g_acc.random_router.fill_topk_buffer(ntok, g_acc.n_expert_k, buf.data());
+    } else {
+        ggml_backend_tensor_get(t, buf.data(), 0, ggml_nbytes(t));
+    }
 
     auto & slice_layer = g_acc.current_slice->topk[il];
     GGML_ASSERT(slice_layer.size() == buf_elems);
@@ -832,6 +839,8 @@ static void print_usage(int argc, char ** argv) {
         "      --questions-per-subject <N>   override QUERIES_PER_SUBJECT (default %d)\n"
         "      --n-shots <N>                override N_SHOT             (default %d)\n"
         "      --gen-tokens <N>             autoregressive decode cap   (default %d, 0 = prompt-only)\n"
+        "      --random-router              replace routed experts with uniform random samples\n"
+        "      --random-seed <N>            seed for random-router mode (default 0)\n"
         "\n"
         "Output control (Phase 3, large-arch memory):\n"
         "      --inter-k-lag <K>             restrict inter-layer to k=1..K only (default 0 = full upper triangular).\n"
@@ -857,6 +866,8 @@ int main(int argc, char ** argv) {
     int         inter_k_lag           = INTER_K_LAG_DEFAULT;
     bool        per_subject_inter     = false;
     int         sparse_min_count      = SPARSE_MIN_COUNT_DEFAULT;
+    bool        random_router         = false;
+    uint64_t    random_seed           = 0;
     std::string mmlu_path             = "build/moe-mmlu/mmlu.jsonl";
     std::string subjects_path         = "build/moe-mmlu/subjects.txt";
     std::string output_path           = "build/moe-coactivation/coactivation.json";
@@ -886,6 +897,10 @@ int main(int argc, char ** argv) {
             per_subject_inter = true;
         } else if (a == "--sparse-min-count") {
             sparse_min_count = std::stoi(next("N"));
+        } else if (a == "--random-router") {
+            random_router = true;
+        } else if (a == "--random-seed") {
+            random_seed = (uint64_t) std::stoull(next("N"));
         } else if (a == "-o" || a == "--output") {
             output_path = next("path");
         } else if (a == "--embeddings") {
@@ -901,8 +916,12 @@ int main(int argc, char ** argv) {
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--mmlu" || a == "--subjects" || a == "--questions-per-subject" || a == "--n-shots" ||
-            a == "--gen-tokens" || a == "--inter-k-lag" || a == "--sparse-min-count") {
+            a == "--gen-tokens" || a == "--inter-k-lag" || a == "--sparse-min-count" ||
+            a == "--random-seed") {
             ++i;
+            continue;
+        }
+        if (a == "--random-router") {
             continue;
         }
         if (a == "-o" || a == "--output") {
@@ -1030,6 +1049,11 @@ int main(int argc, char ** argv) {
     g_acc.n_expert_k = n_expert_k_meta;
     LOG_INF("model n_expert = %d, n_expert_used = %d\n", g_acc.n_expert, g_acc.n_expert_k);
 
+    g_acc.random_router.enabled = random_router;
+    g_acc.random_router.configure(g_acc.n_expert, random_seed);
+    LOG_INF("random router mode = %s (seed=%llu)\n", g_acc.random_router.enabled ? "on" : "off",
+            (unsigned long long) random_seed);
+
     // Phase 3 config validation and propagation.
     if (inter_k_lag < 0) {
         LOG_ERR("--inter-k-lag must be >= 0 (got %d)\n", inter_k_lag);
@@ -1097,6 +1121,9 @@ int main(int argc, char ** argv) {
     for (size_t si = 0; si < subjects.size(); ++si) {
         const std::string & subj = subjects[si];
         g_acc.current_subject    = subj;
+        if (g_acc.random_router.enabled) {
+            g_acc.random_router.seed_subject(params.model.get_name(), g_acc.arch, subj);
+        }
 
         const auto & dev_it  = by_subject_dev.find(subj);
         const auto & test_it = by_subject_test.find(subj);

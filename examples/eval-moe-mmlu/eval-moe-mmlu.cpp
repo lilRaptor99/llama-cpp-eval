@@ -15,6 +15,7 @@
 #include "common.h"
 #include "llama.h"
 #include "log.h"
+#include "../_shared/moe_random_router.h"
 
 #include <algorithm>
 #include <cctype>
@@ -101,6 +102,8 @@ struct moe_accumulator {
 
     // expose shape on first capture so we can validate later tensors
     int seen_k = -1;
+
+    moe_random_router_state random_router;
 };
 
 static moe_accumulator g_acc;
@@ -160,7 +163,11 @@ static bool moe_eval_callback(struct ggml_tensor * t, bool ask, void * user_data
     GGML_ASSERT(stride0 == 1 && "expected contiguous ints along axis 0");
     const size_t         buf_elems = (size_t) ntok * stride1;
     std::vector<int32_t> buf(buf_elems);
-    ggml_backend_tensor_get(t, buf.data(), 0, ggml_nbytes(t));
+    if (g_acc.random_router.enabled) {
+        g_acc.random_router.fill_topk_buffer(ntok, g_acc.n_expert_k, buf.data());
+    } else {
+        ggml_backend_tensor_get(t, buf.data(), 0, ggml_nbytes(t));
+    }
 
     auto & layer_counts = g_acc.counts[g_acc.current_subject][il];
     for (int tok = 0; tok < ntok; ++tok) {
@@ -638,6 +645,8 @@ static void print_usage(int argc, char ** argv) {
             "Run control:\n"
             "      --n-samples <N>              override N_SAMPLES (default %d)\n"
             "      --n-shots <N>                override N_SHOT             (default %d)\n"
+            "      --random-router              replace routed experts with uniform random samples\n"
+            "      --random-seed <N>            seed for random-router mode (default 0)\n"
             "\n"
             "Output:\n"
             "  -o, --output <path>         output JSON (default: build/moe-mmlu/expert_counts.json)\n"
@@ -653,6 +662,8 @@ int main(int argc, char ** argv) {
     // unknown flags don't trip its strict parser.
     int         n_samples   = N_SAMPLES;
     int         n_shot      = N_SHOT;
+    bool        random_router = false;
+    uint64_t    random_seed   = 0;
     std::string mmlu_path   = "build/moe-mmlu/mmlu.jsonl";
     std::string subjects_path = "build/moe-mmlu/subjects.txt";
     std::string output_path = "build/moe-mmlu/expert_counts.json";
@@ -675,6 +686,10 @@ int main(int argc, char ** argv) {
             n_samples = std::stoi(next("N"));
         } else if (a == "--n-shots") {
             n_shot = std::stoi(next("N"));
+        } else if (a == "--random-router") {
+            random_router = true;
+        } else if (a == "--random-seed") {
+            random_seed = (uint64_t) std::stoull(next("N"));
         } else if (a == "-o" || a == "--output") {
             output_path = next("path");
         } else if (a == "--embeddings") {
@@ -690,8 +705,12 @@ int main(int argc, char ** argv) {
     filtered.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        if (a == "--mmlu" || a == "--subjects" || a == "--n-samples" || a == "--n-shots") {
+        if (a == "--mmlu" || a == "--subjects" || a == "--n-samples" || a == "--n-shots" ||
+            a == "--random-seed") {
             ++i;  // skip value too
+            continue;
+        }
+        if (a == "--random-router") {
             continue;
         }
         if (a == "-o" || a == "--output") {
@@ -845,6 +864,11 @@ int main(int argc, char ** argv) {
     g_acc.n_expert_k = n_expert_k_meta;
     LOG_INF("model n_expert = %d, n_expert_used = %d\n", g_acc.n_expert, g_acc.n_expert_k);
 
+    g_acc.random_router.enabled = random_router;
+    g_acc.random_router.configure(g_acc.n_expert, random_seed);
+    LOG_INF("random router mode = %s (seed=%llu)\n", g_acc.random_router.enabled ? "on" : "off",
+            (unsigned long long) random_seed);
+
     // Print system info
     LOG_INF("%s\n", common_params_get_system_info(params).c_str());
 
@@ -879,6 +903,9 @@ int main(int argc, char ** argv) {
     for (size_t si = 0; si < subjects.size(); ++si) {
         const std::string & subj = subjects[si];
         g_acc.current_subject    = subj;
+        if (g_acc.random_router.enabled) {
+            g_acc.random_router.seed_subject(params.model.get_name(), g_acc.arch, subj);
+        }
 
         const auto & dev_it  = by_subject_dev.find(subj);
         const auto & test_it = by_subject_test.find(subj);

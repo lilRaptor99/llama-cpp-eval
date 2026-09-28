@@ -825,7 +825,14 @@ def process_model(model_dir: Path, json_paths: list[Path],
     for jp in json_paths:
         try:
             loaded = _load_one(jp)
-        except (SystemExit, json.JSONDecodeError, OSError) as e:
+        except (SystemExit, json.JSONDecodeError, UnicodeDecodeError,
+                ValueError, OSError) as e:
+            # `UnicodeDecodeError` is a sibling of `json.JSONDecodeError`
+            # (both inherit from `ValueError`) but is NOT a subclass of it,
+            # so we list it explicitly here. We've seen partially-flushed
+            # `expert_counts.json` files contain non-UTF-8 bytes in the
+            # middle of the marginal_expert_counts block — those should be
+            # skipped with a `[skip]` line, not crash the whole aggregator.
             print(f"[skip] {jp}: {e}")
             n_datasets_skipped += 1
             continue

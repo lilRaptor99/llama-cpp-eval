@@ -156,6 +156,7 @@ _DATASET_PUBLISH_LABELS: dict[str, str] = {
     "moe-include":   "INCLUDE",
     "moe-mmlu":      "MMLU",
     "moe-popqa":     "PopQA",
+    "random":        "Random",
 }
 
 # Quant directory on disk -> publishable label.
@@ -192,27 +193,40 @@ _QUANT_PUBLISH_LABELS: dict[str, str] = {
 DEFAULT_CMAP = "Blues"
 
 # Separate colormap for the JS-divergence heatmaps. The user flagged
-# that `Blues_r` collapses the small divergence values (most cross-
+# that `Blues_r` collapsed the small divergence values (most cross-
 # quant matrices live in `0..0.05`) onto a single dark-blue colour,
 # making the differences between dataset / quant pairs visually
 # indistinguishable even though they're numerically distinct.
 #
-# We switch to `viridis_r` because:
+# We use `viridis` (NOT reversed) so the colourbar reads:
 #
-#   1. It's perceptually uniform — a fixed step in the data maps to
-#      a fixed perceptual step in colour, so small value deltas stay
-#      visible regardless of where they sit on the [0, 1] range.
-#   2. It's multi-hue (dark purple → teal → yellow), so even in the
-#      low-value region the hue drifts from purple toward teal as the
-#      value climbs — `Blues_r`'s single-hue dark-blue gradient is
-#      nearly flat in that region.
-#   3. It's the de-facto standard sequential colormap for scientific
+#   - low JS divergence (most similar)        -> dark purple  #440154
+#   - mid JS divergence (e.g. cross-dataset)   -> teal         #21908C
+#   - high JS divergence (most different)      -> bright yellow #FDE725
+#
+# This gives:
+#
+#   1. Perceptually uniform gradient — a fixed step in the data maps
+#      to a fixed perceptual step in colour, so small value deltas
+#      stay visible regardless of where they sit on the [0, 1] range.
+#   2. The "main" colour is purple → teal (the band most of our data
+#      actually lives in), with bright yellow reserved for the
+#      rare off-diagonal cells that hit the upper end of the [0, 1]
+#      range. The user explicitly asked for purple/teal as the
+#      dominant palette (vs `viridis_r`'s yellow/purple), which is
+#      less "loud" and reads better next to the surrounding text in
+#      the paper.
+#   3. Diagonal cells (`v = 0`, perfect agreement) render dark
+#      purple with WHITE text — high contrast and easy to scan,
+#      unlike `viridis_r`'s yellow-with-white-text diagonal which
+#      had poor legibility.
+#   4. De-facto standard sequential colormap for scientific
 #      publication (matplotlib's default since v2.0), so paper
 #      reviewers will recognise it.
-#   4. It's accessible for the most common forms of colour-vision
+#   5. Accessible for the most common forms of colour-vision
 #      deficiency (the CIELAB L* varies monotonically along the
 #      colormap, so even grayscale printing preserves the ordering).
-DEFAULT_JSD_CMAP = "viridis_r"
+DEFAULT_JSD_CMAP = "viridis"
 
 # Default figure width when not specified. ~3.3in = single column in a
 # double-column paper (typical NeurIPS / ACL / IEEE conference style).
@@ -521,11 +535,13 @@ def _render_paper_js_divergence_heatmap(
     the screen-orientation JS-divergence plot in
     `jaccard_sweep_from_cpp.py` / `cross_quant_jaccard_sweep_from_cpp.py`.
 
-    Colormap: defaults to `viridis_r` (`DEFAULT_JSD_CMAP`) which is
-    perceptually uniform, multi-hue (dark purple → teal → yellow), and
-    shows visible variation in the low-value region that `Blues_r`
-    collapses onto a near-uniform dark blue. Override via the
-    `--jsd-cmap` CLI flag (e.g. `magma_r`, `inferno_r`, `cividis`).
+    Colormap: defaults to `viridis` (`DEFAULT_JSD_CMAP`), oriented so
+    dark purple = low divergence (most similar), teal = mid, bright
+    yellow = high (most different). This is the user's preferred
+    direction: purple/teal as the dominant palette reads quieter on
+    the page than yellow/purple. Override via the `--jsd-cmap` CLI
+    flag (e.g. `viridis_r` for the opposite direction, or
+    `magma_r`/`inferno_r`/`cividis`).
 
     Text contrast: cell text colour is chosen via the absolute value
     (vs the colormap's mid-point at `v=0.5`), so off-diagonal cells
@@ -1251,12 +1267,13 @@ def main() -> int:
     parser.add_argument("--jsd-cmap", type=str, default=DEFAULT_JSD_CMAP,
                         help=f"Colormap for the JS-divergence heatmaps "
                              f"(default: {DEFAULT_JSD_CMAP}). The default "
-                             f"is `viridis_r` (perceptually uniform, "
-                             f"multi-hue) — alternatives include "
-                             f"`magma_r`, `inferno_r`, `cividis`. "
-                             f"Try a different one if the small-value "
-                             f"variations are hard to see in your "
-                             f"specific dataset.")
+                             f"is `viridis` oriented with dark purple = low "
+                             f"divergence, teal = mid, bright yellow = high. "
+                             f"Alternatives include `viridis_r` (opposite "
+                             f"direction), `magma_r`, `inferno_r`, "
+                             f"`cividis`. Try a different one if the "
+                             f"small-value variations are hard to see in "
+                             f"your specific dataset.")
     parser.add_argument("--width-in", type=float, default=DEFAULT_WIDTH_IN,
                         help=f"Figure width in inches "
                              f"(default: {DEFAULT_WIDTH_IN}).")

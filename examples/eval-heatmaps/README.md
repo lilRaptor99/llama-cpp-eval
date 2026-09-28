@@ -107,26 +107,36 @@ cross-quant: one per model).
 JS-divergence values across figures against the canonical metric
 range, not against whatever happens to sit in this particular cell.
 
-**Colormap: `viridis_r`** (default, see `--jsd-cmap` below). The
-previous default `Blues_r` collapsed the small divergence values
+**Colormap: `viridis`** (default, see `--jsd-cmap` below), oriented
+with dark purple = low divergence (most similar), teal = mid
+divergence, bright yellow = high divergence (most different). The
+user explicitly requested this orientation so that **purple-teal is
+the dominant palette** in the paper (matches their preferred "quiet"
+look next to surrounding text), with bright yellow reserved for the
+rare off-diagonal cells that hit the upper end of the [0, 1] range.
+A side-benefit: the diagonal cells (`v = 0`, perfect agreement)
+now render dark purple with WHITE text — high contrast and easy to
+scan, unlike the previous `viridis_r` orientation where the yellow
+diagonal had white-on-yellow legibility issues.
+
+The earlier `Blues_r` default collapsed the small divergence values
 (most cross-quant matrices live in `0..0.05`) onto a near-uniform
-dark-blue gradient, making the differences between dataset / quant
-pairs visually indistinguishable even when they're numerically
-distinct. `viridis_r` is perceptually uniform AND multi-hue
-(dark purple → teal → bright yellow), so even at a fixed 0..1
-range the hue drifts visibly as values climb from 0.0 toward the
-mid-range. Alternatives include `magma_r`, `inferno_r`, `cividis`
-— all perceptually-uniform scientific colormaps.
+dark-blue gradient; `viridis` is perceptually uniform AND multi-hue
+(dark purple → teal → bright yellow), so even at a fixed 0..1 range
+the hue drifts visibly as values climb from 0.0 toward the mid-range.
+Alternatives include `viridis_r` (reversed direction),
+`magma_r`, `inferno_r`, `cividis` — all perceptually-uniform
+scientific colormaps.
 
 > **Note on cross-quant values.** With `vmax=1` fixed, a cross-quant
 > matrix whose largest off-diagonal is `2.4e-4` (typical for
 > bit-identical quants) only occupies 0.024 % of the colour range.
-> Even `viridis_r` cannot resolve sub-percent differences visually;
-> the colour cue is essentially "all yellow" for the whole matrix in
-> that regime. The cell text (`0.0002`) is the only way to read the
-> exact value. If this is a recurring need, override the colour
-> gradient per-cell (e.g., per-figure `--jsd-cmap`) or open an issue
-> for an "auto-scale" mode (the earlier prototype used it).
+> Even `viridis` cannot resolve sub-percent differences visually;
+> the colour cue is essentially "all dark purple" for the whole
+> matrix in that regime. The cell text (`0.0002`) is the only way to
+> read the exact value. If this is a recurring need, override the
+> colour gradient per-cell (e.g., per-figure `--jsd-cmap`) or open
+> an issue for an "auto-scale" mode (the earlier prototype used it).
 
 ## How it differs from the existing overview heatmaps
 
@@ -187,7 +197,7 @@ python examples/eval-heatmaps/paper_heatmaps.py \
 | `--num-ks`             | Number of K values in the linear sweep (debug / single-cell).                                                | `21`                             |
 | `--dpi`                | PNG DPI for the heatmap.                                                                                     | `300`                            |
 | `--cmap`               | Colormap for the Jaccard / routing-strip heatmaps (publication convention: `Blues`).                         | `Blues`                          |
-| `--jsd-cmap`           | Colormap for the JS-divergence heatmaps (perceptually uniform, multi-hue).                                   | `viridis_r`                      |
+| `--jsd-cmap`           | Colormap for the JS-divergence heatmaps (perceptually uniform, multi-hue).                                   | `viridis`                        |
 | `--width-in`           | Figure width in inches (paper-column budget).                                                                | `3.3`                            |
 | `--per-cell`           | Also emit one routing-strip heatmap per `(model, quant)` cell.                                               | off                              |
 | `--skip-cross-quant`   | Skip the cross-quantization view.                                                                            | off                              |

@@ -187,6 +187,7 @@ _QUANT_PUBLISH_LABELS: dict[str, str] = {
     "F32":    "F32",
     "FP8":    "FP8",
     "Q8_K":   "Q8_K",
+    "RANDOM": "Random",
 }
 
 # Publishable colormap (publication convention: sequential blue).
@@ -464,7 +465,16 @@ def _render_paper_heatmap(
     """
     fig, ax = plt.subplots(figsize=(width_in, height_in), dpi=dpi)
     vmin, vmax = 0.0, 1.0
-    im = ax.imshow(mat, vmin=vmin, vmax=vmax, cmap=cmap, aspect="auto",
+    # `aspect="equal"` forces each cell to be a square. With
+    # `aspect="auto"` (the imshow default) the cells scale to fill the
+    # axes, which is non-square because of the y-tick labels (e.g.
+    # ``HumanEval``) and the colorbar — the result is wider-than-tall
+    # cells, which the user flagged as ``the heatmap is rectangular``.
+    # `aspect="equal"` makes the heatmap dimensions match the data
+    # aspect ratio (1:1 for an NxN matrix), so the matrix of cells
+    # is strictly square even when the surrounding figure carries
+    # extra labels.
+    im = ax.imshow(mat, vmin=vmin, vmax=vmax, cmap=cmap, aspect="equal",
                    interpolation="nearest")
     # Tick labels (the ONLY labels the paper figure carries).
     N = len(labels)
@@ -561,8 +571,12 @@ def _render_paper_js_divergence_heatmap(
     # compared across figures without re-scaling per-cell.
     vmin, vmax = 0.0, 1.0
 
+    # `aspect="equal"` so the heatmap matrix itself is square
+    # (each cell is 1:1), regardless of how the surrounding axes /
+    # colorbar / tick labels distort the surrounding figure. See
+    # the same note in `_render_paper_heatmap` for the Jaccard view.
     im = ax.imshow(mat, vmin=vmin, vmax=vmax, cmap=cmap,
-                   aspect="auto", interpolation="nearest")
+                   aspect="equal", interpolation="nearest")
     N = len(labels)
     # Same rotation rule as the Jaccard renderer so the two views
     # look consistent in the paper.
@@ -583,14 +597,28 @@ def _render_paper_js_divergence_heatmap(
         ax.set_xticklabels([labels[0] if labels else ""], fontsize=8)
         ax.set_yticks([0])
         ax.set_yticklabels([labels[0] if labels else ""], fontsize=8)
-    ax.tick_params(axis="both", which="both", length=0)
+    # Pad tick labels off the heatmap edge so long y-tick labels like
+    # ``HumanEval`` don't visually touch the first column of cells
+    # (matters most for N>=6 where the cell width is already tight).
+    ax.tick_params(axis="both", which="both", length=0, pad=2)
     for spine in ax.spines.values():
         spine.set_visible(False)
 
     # -------- per-cell text ----------
-    # 4dp cell text (e.g. `0.0360`, `0.0002`) — readable across the
-    # full metric range. Diagonal cells naturally render as `0.0000`.
-    cell_fmt = "{v:.4f}"
+    # Cell text format / size depends on how crowded the matrix is:
+    #   - N <= 5  -> 4dp, 8pt (full precision, lots of room per cell)
+    #   - N >= 6  -> 3dp, 7pt (shorter / smaller so values don't
+    #                 touch their neighbours or the y-tick labels)
+    # The user flagged the N=6 case (BBH + HumanEval + INCLUDE + MMLU
+    # + PopQA + Random) where 4dp text rendered as ``0.0000`` was
+    # crowded against both the y-tick labels (e.g. ``BBH``) and the
+    # next cell's value (``0.0089``). 3dp at 7pt solves both.
+    if N <= 5:
+        cell_fmt = "{v:.4f}"
+        cell_fontsize = 8
+    else:
+        cell_fmt = "{v:.3f}"
+        cell_fontsize = 7
     for i in range(mat.shape[0]):
         for j in range(mat.shape[1]):
             v = float(mat[i, j])
@@ -600,7 +628,7 @@ def _render_paper_js_divergence_heatmap(
             # diagonal (v=0) is unambiguously on the white-text side.
             color = "white" if v < 0.5 else "black"
             ax.text(j, i, cell_fmt.format(v=v), ha="center", va="center",
-                    fontsize=8, color=color)
+                    fontsize=cell_fontsize, color=color)
 
     cb = fig.colorbar(im, ax=ax, fraction=_CBAR_FRACTION, pad=_CBAR_PAD)
     cb.ax.tick_params(labelsize=7, length=0)
@@ -777,7 +805,17 @@ def _iter_cell_paths(cell_dir: Path) -> list[tuple[str, Path]]:
     """Return `[(dataset_label, expert_counts_json), ...]` for a cell.
 
     A "cell" is one `(model, quant)` directory containing the five
-    `moe-<dataset>/expert_counts.json` files.
+    `moe-<dataset>/expert_counts.json` files plus (optionally) a
+    top-level `random/expert_counts.json` representing aggregated
+    random-router baseline results.
+
+    The Random dataset is auto-aggregated from per-benchmark
+    `<moe-<ds>/random/expert_counts.json>` files when present
+    (one per dataset the random baseline ran on). The aggregand is
+    the sum of `aggregate.marginal_expert_counts` across those
+    per-benchmark random JSONs — the same convention
+    `aggregate_overview.py` uses for the per-quant aggregated-
+    across-datasets counts matrix.
     """
     out: list[tuple[str, Path]] = []
     if not cell_dir.is_dir():
@@ -791,15 +829,93 @@ def _iter_cell_paths(cell_dir: Path) -> list[tuple[str, Path]]:
     return out
 
 
+def _maybe_aggregate_random(cell_dir: Path
+                             ) -> tuple[dict[str, np.ndarray], dict[str, Any]] | None:
+    """Build a synthetic "Random" dataset by summing per-benchmark
+    random-router expert_counts.json files.
+
+    Returns None when no `<moe-<ds>/random/expert_counts.json>` exists
+    (so the user's cell doesn't actually have random baseline data).
+    When present, returns:
+      - counts[L, E] : aggregated `aggregate.marginal_expert_counts`
+      - meta         : dict with `n_tokens`, `n_rows`, etc. derived
+                       from the same per-benchmark JSONs
+
+    The aggregation sums the marginal counts across all per-benchmark
+    random JSONs. Tokens and rows are summed in the same way so the
+    synthetic Random row in `summary.csv` / `top_experts.json` reads
+    consistently with the real datasets.
+    """
+    random_jsons = sorted(cell_dir.glob("moe-*/random/expert_counts.json"))
+    if not random_jsons:
+        return None
+    arch: dict[str, Any] | None = None
+    agg: np.ndarray | None = None
+    n_tokens = 0
+    n_rows = 0
+    for jp in random_jsons:
+        try:
+            with open(jp) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"[warn] {jp}: {e}; skipping from Random aggregate")
+            continue
+        a_in = data.get("model_arch") or {}
+        L = int(a_in.get("n_layer", 0))
+        E = int(a_in.get("n_expert", 0))
+        k = int(a_in.get("n_expert_used", 0))
+        if L <= 0 or E <= 0 or k <= 0:
+            continue
+        marginal = (data.get("aggregate") or {}).get("marginal_expert_counts")
+        if marginal is None:
+            continue
+        m = np.asarray(marginal, dtype=np.int64)
+        if m.shape != (L, E):
+            continue
+        if arch is None:
+            arch = {"name": a_in.get("name", "unknown"), "n_layer": L,
+                    "n_expert": E, "n_expert_used": k}
+            agg = m.copy()
+        else:
+            if (L != arch["n_layer"] or E != arch["n_expert"]
+                    or k != arch["n_expert_used"]):
+                print(f"[warn] {jp}: arch mismatch; skipping from Random "
+                      f"aggregate (L={L} E={E} k={k} vs "
+                      f"L={arch['n_layer']} E={arch['n_expert']} "
+                      f"k={arch['n_expert_used']})")
+                continue
+            agg = agg + m
+        totals = data.get("totals") or {}
+        n_tokens += int(totals.get("tokens_total", 0))
+        n_rows += 1
+    if arch is None or agg is None:
+        return None
+    return ({"Random": agg},
+            {"Random": {
+                "n_tokens": n_tokens,
+                "n_rows": n_rows,
+                "arch": arch,
+            }})
+
+
 def _make_figure_size(N: int, width_in: float, cells_per_inch: float = 5.5,
-                       min_height_in: float = 1.4) -> tuple[float, float]:
+                       min_height_in: float = 1.4,
+                       aspect: str = "auto") -> tuple[float, float]:
     """Pick `(width_in, height_in)` for a square-ish N x N heatmap.
 
-    We keep width at `width_in` (paper column budget) and grow height
-    proportionally to N (so 5 benchmarks stay roughly square, not
-    squashed into a 3.3 x 3.3 rectangle that makes labels overlap).
+    `aspect='auto'` (default): height scales with N so a 5-benchmark
+    matrix stays roughly square (existing Jaccard behaviour).
+
+    `aspect='square'`: enforce a strict square (height == width). The
+    user asked for this on the JSD heatmap because the paper context
+    compares it side-by-side with the Jaccard heatmap, which is
+    already visually square — a square JSD reads as a clean
+    peer rather than a stretched-out bar.
     """
-    h = max(min_height_in, N * width_in / cells_per_inch)
+    if aspect == "square":
+        h = max(min_height_in, width_in)
+    else:
+        h = max(min_height_in, N * width_in / cells_per_inch)
     return width_in, h
 
 
@@ -859,6 +975,33 @@ def _process_one_dataset_cell(
         per_ds_counts[publish_ds] = c
         per_ds_tokens[publish_ds] = t
 
+    # ---- auto-aggregate per-benchmark random-router results
+    # into a synthetic top-level ``Random`` dataset. Only run when the
+    # arch is already known (all real benchmarks share arch) AND at
+    # least one `<moe-<ds>/random/expert_counts.json` file exists.
+    # When present, this expands the N=5 cross-dataset matrix to N=6
+    # so the paper can compare real-routing vs random-routing JSD /
+    # Jaccard directly.
+    random_agg = _maybe_aggregate_random(cell_dir)
+    if random_agg is not None and arch is not None:
+        rand_counts, rand_meta = random_agg
+        # Arch check: the random router must share arch with the
+        # real benchmarks (same L/E/k). The aggregator already filters
+        # mismatched entries; if the result is empty we just skip.
+        r_arch = next(iter(rand_meta.values()))["arch"]
+        if (r_arch["n_layer"] == arch["n_layer"]
+                and r_arch["n_expert"] == arch["n_expert"]
+                and r_arch["n_expert_used"] == arch["n_expert_used"]):
+            for ds, c in rand_counts.items():
+                publish_ds = _publish_dataset_label(ds)
+                # Don't clobber a real "Random" cell entry if one exists.
+                per_ds_counts.setdefault(publish_ds, c)
+                per_ds_tokens.setdefault(publish_ds,
+                                          rand_meta[ds]["n_tokens"])
+            print(f"[random] aggregated {rand_meta['Random']['n_rows']} "
+                  f"per-benchmark random JSON(s) into the cell's "
+                  f"Random dataset (tokens={rand_meta['Random']['n_tokens']:,})")
+
     if arch is None or len(per_ds_counts) < 2:
         # Need at least 2 datasets to compute pairwise Jaccard.
         return {"cell_dir": str(cell_dir), "skipped": True,
@@ -870,14 +1013,23 @@ def _process_one_dataset_cell(
     K_values = _make_k_values(E, K_model, k_min, k_max_frac, num_ks)
 
     # Sort dataset labels with the user-requested order at the front.
-    preferred_order = ["BBH", "HumanEval", "INCLUDE", "MMLU", "PopQA"]
+    # ``Random`` is appended at the END so the comparison reads
+    # naturally: real benchmarks first, baseline at the bottom.
+    preferred_order = ["BBH", "HumanEval", "INCLUDE", "MMLU", "PopQA",
+                        "Random"]
     labels = [d for d in preferred_order if d in per_ds_counts]
     labels += [d for d in sorted(per_ds_counts.keys()) if d not in labels]
     counts_list = [per_ds_counts[d] for d in labels]
 
-    # Figure size for a square-ish heatmap (cap the height so 5x5 is OK).
+    # Square aspect ratio so the Jaccard heatmap and the JS-divergence
+    # heatmap sit side-by-side in the paper as perfect peers (the
+    # user flagged the Jaccard heatmap as still rectangular; both
+    # views now use the same `width_in x width_in` figure size so
+    # they're visually equivalent regardless of `N`).
     N = len(labels)
-    width_in_use, height_in_use = _make_figure_size(N, width_in)
+    width_in_use, height_in_use = _make_figure_size(
+        N, width_in, aspect="square",
+    )
 
     # File prefix: model + quant in their publishable spelling, with
     # all filesystem-unfriendly chars replaced by underscores. This
@@ -919,22 +1071,34 @@ def _process_one_dataset_cell(
             mat, labels, width_in=width_in_use, height_in=height_in_use,
             cmap=cmap, cell_text=with_text, dpi=dpi,
         )
+        # `bbox_inches="tight"` crops the output to the actual content
+        # size — so the figure has no extra whitespace on top/bottom
+        # (the user flagged this after the square fix; combined with
+        # `aspect="equal"` the cells are still strictly square, just
+        # the overall figure dimensions track the content). Earlier we
+        # used `bbox_inches=None` to force a square output, but that
+        # left empty space above/below the heatmap once the cells
+        # could no longer fill the full axes.
         fig.savefig(out_png, dpi=dpi, bbox_inches="tight")
         plt.close(fig)
         rendered.append((K, str(out_png)))
         print(f"[save] {out_png}  (K={K})")
 
     # ---- js_divergence_dataset.png (cross-dataset JS-divergence,
-    # layer-averaged, single heatmap)
+    # layer-averaged, single heatmap). Square aspect ratio so the
+    # figure reads as a clean peer to the Jaccard heatmap above.
     js_png = output_dir / f"{fname_base}__js_divergence_dataset.png"
     if js_png.exists() and not force:
         print(f"[skip] {js_png} exists; pass --force to regenerate")
         skipped_files.append(str(js_png))
     else:
         js_mat = _layer_averaged_js_divergence_matrix(counts_list)
+        jsd_width, jsd_height = _make_figure_size(
+            N, width_in, aspect="square",
+        )
         fig = _render_paper_js_divergence_heatmap(
             js_mat, labels,
-            width_in=width_in_use, height_in=height_in_use, dpi=dpi,
+            width_in=jsd_width, height_in=jsd_height, dpi=dpi,
             cmap=jsd_cmap,
         )
         fig.savefig(js_png, dpi=dpi, bbox_inches="tight")
@@ -1066,9 +1230,12 @@ def _process_one_cross_quant(
     labels += [q for q in sorted(per_quant_counts.keys()) if q not in labels]
     counts_list = [per_quant_counts[q] for q in labels]
 
+    # Square aspect ratio so the Jaccard heatmap and the JS-divergence
+    # heatmap sit side-by-side in the paper as perfect peers.
     N = len(labels)
-    width_in_use, height_in_use = _make_figure_size(N, width_in,
-                                                     cells_per_inch=4.0)
+    width_in_use, height_in_use = _make_figure_size(
+        N, width_in, aspect="square",
+    )
     fname_base = _safe_filename(f"{model_label}")
 
     rendered: list[tuple[int, str]] = []
@@ -1099,23 +1266,29 @@ def _process_one_cross_quant(
             mat, labels, width_in=width_in_use, height_in=height_in_use,
             cmap=cmap, cell_text=with_text, dpi=dpi,
         )
+        # `bbox_inches="tight"` crops to the content size so the
+        # figure has no extra whitespace on top/bottom. See the
+        # cross-dataset call site above for the full rationale.
         fig.savefig(out_png, dpi=dpi, bbox_inches="tight")
         plt.close(fig)
         rendered.append((K, str(out_png)))
         print(f"[save] {out_png}  (K={K})")
 
     # ---- js_divergence_quant.png (cross-quant JS-divergence,
-    # layer-averaged, single heatmap). Same convention as the
-    # cross-quant viewport in `cross_quant_jaccard_sweep_from_cpp.py`.
+    # layer-averaged, single heatmap). Square aspect ratio so the
+    # figure reads as a clean peer to the Jaccard heatmap above.
     js_png = output_dir / f"{fname_base}__js_divergence_quant.png"
     if js_png.exists() and not force:
         print(f"[skip] {js_png} exists; pass --force to regenerate")
         skipped_files.append(str(js_png))
     else:
         js_mat = _layer_averaged_js_divergence_matrix(counts_list)
+        jsd_width, jsd_height = _make_figure_size(
+            N, width_in, aspect="square",
+        )
         fig = _render_paper_js_divergence_heatmap(
             js_mat, labels,
-            width_in=width_in_use, height_in=height_in_use, dpi=dpi,
+            width_in=jsd_width, height_in=jsd_height, dpi=dpi,
             cmap=jsd_cmap,
         )
         fig.savefig(js_png, dpi=dpi, bbox_inches="tight")

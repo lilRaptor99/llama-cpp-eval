@@ -14,8 +14,8 @@ per (cell, view) and one optional routing strip per cell:
 
 | View                       | Description                                                                                          | Output layout                                                              |
 | -------------------------- | ---------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
-| **Cross-dataset Jaccard**  | Pairwise top-K Jaccard across the five benchmarks (BBH / HumanEval / INCLUDE / MMLU / PopQA).       | One subdirectory per model, three PNGs per `(model, quant)` at K_model / 2x / 3x. |
-| **Cross-dataset JS**       | Layer-averaged pairwise Jensen-Shannon divergence across the five benchmarks.                        | One PNG per `(model, quant)` cell.                                          |
+| **Cross-dataset Jaccard**  | Pairwise top-K Jaccard across the five benchmarks (BBH / HumanEval / INCLUDE / MMLU / PopQA), plus a sixth "Random" baseline when per-benchmark `random/` JSONs are present. | One subdirectory per model, three PNGs per `(model, quant)` at K_model / 2x / 3x. |
+| **Cross-dataset JS**       | Layer-averaged pairwise Jensen-Shannon divergence across the same datasets (incl. Random if available). | One PNG per `(model, quant)` cell.                                          |
 | **Cross-quant Jaccard**    | Pairwise top-K Jaccard across quantizations for a single model.                                      | Three PNGs per model at K_model / 2x / 3x.                                 |
 | **Cross-quant JS**         | Layer-averaged pairwise Jensen-Shannon divergence across quantizations for a single model.          | One PNG per model.                                                          |
 | **Routing strip** (optional) | Compact `[L, E]` heatmap of the aggregated expert counts (raw, no log) per cell, with layer & expert indices on the axes. | One PNG per `(model, quant)` cell. |
@@ -55,6 +55,15 @@ For each `(model, quant)` cell under `<results-dir>/<model>/<quant>/`:
   HumanEval, INCLUDE, MMLU, PopQA** (the on-disk directory name is
   `moe-<dataset>`; the alias lives in `_DATASET_PUBLISH_LABELS` at
   the top of `paper_heatmaps.py`).
+- **Optional 6th dataset: `Random`.** When one or more
+  `<moe-<ds>/random/expert_counts.json` files exist in the cell, the
+  script auto-aggregates them into a synthetic top-level "Random"
+  dataset (sum of `aggregate.marginal_expert_counts` across the
+  per-benchmark random JSONs, identical to the convention
+  `aggregate_overview.py` uses for the per-quant aggregated reference)
+  and adds it as the 6th row/column of every cross-dataset heatmap.
+  This lets the paper compare real-routing vs random-routing JSD /
+  Jaccard directly, alongside the real benchmarks.
 
 ### Cross-quantization heatmap
 

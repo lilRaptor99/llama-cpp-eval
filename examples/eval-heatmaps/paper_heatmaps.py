@@ -156,7 +156,7 @@ _DATASET_PUBLISH_LABELS: dict[str, str] = {
     "moe-include":   "INCLUDE",
     "moe-mmlu":      "MMLU",
     "moe-popqa":     "PopQA",
-    "random":        "Random",
+    "random":        "Uniform",
 }
 
 # Quant directory on disk -> publishable label.
@@ -187,47 +187,36 @@ _QUANT_PUBLISH_LABELS: dict[str, str] = {
     "F32":    "F32",
     "FP8":    "FP8",
     "Q8_K":   "Q8_K",
-    "RANDOM": "Random",
+    "RANDOM": "Uniform",
 }
 
 # Publishable colormap (publication convention: sequential blue).
 DEFAULT_CMAP = "Blues"
 
-# Separate colormap for the JS-divergence heatmaps. The user flagged
-# that `Blues_r` collapsed the small divergence values (most cross-
-# quant matrices live in `0..0.05`) onto a single dark-blue colour,
-# making the differences between dataset / quant pairs visually
-# indistinguishable even though they're numerically distinct.
+# Separate colormap for the JS-divergence heatmaps. The user wants
+# **visual coherence with the Jaccard heatmaps** so the two views
+# read as the same kind of figure side-by-side in the paper:
 #
-# We use `viridis` (NOT reversed) so the colourbar reads:
+#   - Jaccard heatmaps use `Blues` (NOT reversed). High similarity
+#     (= perfect agreement, the diagonal) renders dark blue;
+#     off-diagonal cells (less similar) fade toward white.
+#   - JSD heatmaps use `Blues_r` (REVERSED). Low divergence
+#     (= perfect agreement, the diagonal) renders dark blue;
+#     high-divergence off-diagonal cells fade toward white.
 #
-#   - low JS divergence (most similar)        -> dark purple  #440154
-#   - mid JS divergence (e.g. cross-dataset)   -> teal         #21908C
-#   - high JS divergence (most different)      -> bright yellow #FDE725
+# In both cases, "the two datasets are the same" maps to the DARKEST
+# blue cell with WHITE text — the paper reader instantly recognises
+# the diagonal as "agreement" without having to read the number,
+# because the visual encoding is identical between the two views.
+# Conversely, "very different" maps to WHITE in both cases — again
+# the same convention. This is exactly what the user asked for.
 #
-# This gives:
-#
-#   1. Perceptually uniform gradient — a fixed step in the data maps
-#      to a fixed perceptual step in colour, so small value deltas
-#      stay visible regardless of where they sit on the [0, 1] range.
-#   2. The "main" colour is purple → teal (the band most of our data
-#      actually lives in), with bright yellow reserved for the
-#      rare off-diagonal cells that hit the upper end of the [0, 1]
-#      range. The user explicitly asked for purple/teal as the
-#      dominant palette (vs `viridis_r`'s yellow/purple), which is
-#      less "loud" and reads better next to the surrounding text in
-#      the paper.
-#   3. Diagonal cells (`v = 0`, perfect agreement) render dark
-#      purple with WHITE text — high contrast and easy to scan,
-#      unlike `viridis_r`'s yellow-with-white-text diagonal which
-#      had poor legibility.
-#   4. De-facto standard sequential colormap for scientific
-#      publication (matplotlib's default since v2.0), so paper
-#      reviewers will recognise it.
-#   5. Accessible for the most common forms of colour-vision
-#      deficiency (the CIELAB L* varies monotonically along the
-#      colormap, so even grayscale printing preserves the ordering).
-DEFAULT_JSD_CMAP = "viridis"
+# Auto-scaling: the upper end of the colourbar is set to the global
+# JSD max across all matrices in the run (computed in a pre-pass
+# by `main()`), so the actual data range drives the dark end of
+# the gradient — see `_render_paper_js_divergence_heatmap` and the
+# `main()` pre-pass for the full logic.
+DEFAULT_JSD_CMAP = "Blues_r"
 
 # Default figure width when not specified. ~3.3in = single column in a
 # double-column paper (typical NeurIPS / ACL / IEEE conference style).
@@ -533,43 +522,58 @@ def _render_paper_heatmap(
 
 def _render_paper_js_divergence_heatmap(
         mat: np.ndarray, labels: list[str], *, width_in: float,
-        height_in: float, dpi: int = 300,
+        height_in: float, vmax: float = 1.0,
+        dpi: int = 300,
         cmap: str = DEFAULT_JSD_CMAP,
         ) -> plt.Figure:
     """Publication-quality JS-divergence heatmap.
 
-    Range contract: the colorbar always spans **fixed `vmin=0, vmax=1`**
-    so the reader can compare JS-divergence values across the paper
-    against the canonical metric range, not against whatever happens
-    to sit in this particular cell. This is the same convention as
-    the screen-orientation JS-divergence plot in
-    `jaccard_sweep_from_cpp.py` / `cross_quant_jaccard_sweep_from_cpp.py`.
+    Range contract: `vmin` is fixed at 0 (the metric's natural floor)
+    and `vmax` defaults to 1.0 but is auto-scaled to the largest JSD
+    value across the entire results set when called from `main()`
+    (pre-pass: collect every JSD matrix, take the global max, pass
+    it as `vmax` to this renderer). With a fixed `vmax=1` the
+    ``Blues`` cmap would collapse sub-percent values onto a single
+    near-white colour; the auto-scaling fixes that and makes the
+    visual encoding actually useful across both cross-dataset
+    matrices (values 0..0.3 typical) and cross-quant matrices
+    (values 0..0.001 typical).
 
-    Colormap: defaults to `viridis` (`DEFAULT_JSD_CMAP`), oriented so
-    dark purple = low divergence (most similar), teal = mid, bright
-    yellow = high (most different). This is the user's preferred
-    direction: purple/teal as the dominant palette reads quieter on
-    the page than yellow/purple. Override via the `--jsd-cmap` CLI
-    flag (e.g. `viridis_r` for the opposite direction, or
-    `magma_r`/`inferno_r`/`cividis`).
+    Colormap: defaults to `Blues_r` (`DEFAULT_JSD_CMAP`), chosen
+    for visual coherence with the Jaccard heatmaps (`Blues`, NOT
+    reversed). In both:
+      - the diagonal ("agreement") renders dark blue with white text
+      - off-diagonal cells fade toward white as the value climbs
+    `Blues_r` (REVERSED) flips the direction so JSD's low end
+    (perfect agreement, `v = 0`) lands on the dark blue — exactly
+    like Jaccard's high end (perfect agreement, `v = 1`). The reader
+    instantly recognises "same pair" cells as dark blue regardless
+    of which view they're looking at. Override via the `--jsd-cmap`
+    CLI flag (e.g. `Blues`, `viridis`, `magma`, `cividis`).
 
-    Text contrast: cell text colour is chosen via the absolute value
-    (vs the colormap's mid-point at `v=0.5`), so off-diagonal cells
-    that drift slightly above 0.0 still get white text on the dark
-    purple background — readable.
+    Text contrast: cell text colour is chosen via the relative
+    position `v / vmax` (vs the colormap's mid-point at 0.5), so
+    cells at the bottom of the (auto-scaled) range get WHITE text
+    on their dark `Blues_r` colour and cells near the top get BLACK
+    text on the light end. The diagonal (v=0) is always on the
+    white-text side — readable.
 
-    6 colourbar ticks at `0, 0.2, 0.4, 0.6, 0.8, 1.0` with 3-decimal
-    formatting (covers the full metric range uniformly).
+    6 colourbar ticks at `0, vmax*1/5, vmax*2/5, ..., vmax` with
+    3-decimal formatting (covers the auto-scaled range uniformly).
 
     No title, no axis heading, no spines — exactly what
     `\\includegraphics` wants.
     """
     fig, ax = plt.subplots(figsize=(width_in, height_in), dpi=dpi)
 
-    # -------- fixed metric range ----------
-    # The user explicitly requested 0..1 so JS-divergence values can be
-    # compared across figures without re-scaling per-cell.
-    vmin, vmax = 0.0, 1.0
+    # -------- auto-scaled metric range ----------
+    # vmin=0 is the metric's natural floor; vmax is computed by
+    # main() to be the global max across all JSD matrices in the
+    # current run. With this fix, cross-dataset (max ~0.3) and
+    # cross-quant (max ~0.001) JSD heatmaps can share a colormap and
+    # still be readable on a paper page.
+    vmin = 0.0
+    vmax = float(vmax)
 
     # `aspect="equal"` so the heatmap matrix itself is square
     # (each cell is 1:1), regardless of how the surrounding axes /
@@ -622,21 +626,25 @@ def _render_paper_js_divergence_heatmap(
     for i in range(mat.shape[0]):
         for j in range(mat.shape[1]):
             v = float(mat[i, j])
-            # Threshold at 0.5 (the absolute mid-point of the colormap)
-            # — values below 0.5 get white text on the dark half of
-            # the colormap; values at or above get black text. The
-            # diagonal (v=0) is unambiguously on the white-text side.
-            color = "white" if v < 0.5 else "black"
+            # Relative threshold on `v / vmax` so the dark-text / white-
+            # text decision tracks the auto-scaled range. With the
+            # `Blues_r` cmap (dark at 0, light at vmax), values below
+            # the midpoint of the data range get white text on the
+            # dark half of the colormap, and values above get black
+            # text on the light half. The diagonal (v=0) is always
+            # unambiguously on the white-text side — readable on the
+            # dark blue that `Blues_r` assigns to it.
+            color = "white" if v < 0.5 * vmax else "black"
             ax.text(j, i, cell_fmt.format(v=v), ha="center", va="center",
                     fontsize=cell_fontsize, color=color)
 
     cb = fig.colorbar(im, ax=ax, fraction=_CBAR_FRACTION, pad=_CBAR_PAD)
     cb.ax.tick_params(labelsize=7, length=0)
     cb.outline.set_visible(False)
-    # 6 ticks uniformly distributed across [0, 1] (the fixed metric
+    # 6 ticks uniformly distributed across [0, vmax] (the auto-scaled
     # range). The reader sees the position of every value relative to
     # the canonical range at a glance.
-    cb.set_ticks(np.linspace(0.0, 1.0, 6))
+    cb.set_ticks(np.linspace(0.0, vmax, 6))
     cb.ax.yaxis.set_major_formatter(FuncFormatter(
         lambda x, p: f"{x:.3f}"
     ))
@@ -857,7 +865,12 @@ def _maybe_aggregate_random(cell_dir: Path
         try:
             with open(jp) as f:
                 data = json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError, OSError) as e:
+            # `UnicodeDecodeError` is a sibling of `json.JSONDecodeError`
+            # (both inherit from `ValueError`) but is NOT a subclass of
+            # it, so we list it explicitly. Same rationale as the
+            # catch in `aggregate_overview.py`: partially-flushed
+            # JSONs should be skipped gracefully, not crash the run.
             print(f"[warn] {jp}: {e}; skipping from Random aggregate")
             continue
         a_in = data.get("model_arch") or {}
@@ -919,6 +932,105 @@ def _make_figure_size(N: int, width_in: float, cells_per_inch: float = 5.5,
     return width_in, h
 
 
+def _compute_dataset_cell_jsd_max(cell_dir: Path) -> float:
+    """Compute the JSD matrix for one cell and return its max value.
+
+    Returns 0.0 if the cell has no usable datasets (so we can take
+    the max across multiple cells without special-casing the empty
+    result). Used by `main()` in a pre-pass to compute the global
+    JSD max across all cells, then render every JSD heatmap with
+    that shared `vmax` so all colorbars are directly comparable
+    across the paper.
+    """
+    cell_dir = cell_dir.resolve()
+    items = _iter_cell_paths(cell_dir)
+    if not items:
+        return 0.0
+
+    per_ds_counts: dict[str, np.ndarray] = {}
+    arch: dict[str, Any] | None = None
+    for ds, ec in items:
+        try:
+            a, c, _t = _load_one_dataset_counts(ec)
+        except (ValueError, json.JSONDecodeError, OSError):
+            continue
+        if arch is None:
+            arch = a
+        elif (a["n_layer"] != arch["n_layer"]
+              or a["n_expert"] != arch["n_expert"]
+              or a["n_expert_used"] != arch["n_expert_used"]):
+            continue
+        publish_ds = _publish_dataset_label(ds)
+        per_ds_counts[publish_ds] = c
+
+    # Auto-aggregate the Random baseline (same as the render path).
+    random_agg = _maybe_aggregate_random(cell_dir)
+    if random_agg is not None and arch is not None:
+        rand_counts, rand_meta = random_agg
+        r_arch = next(iter(rand_meta.values()))["arch"]
+        if (r_arch["n_layer"] == arch["n_layer"]
+                and r_arch["n_expert"] == arch["n_expert"]
+                and r_arch["n_expert_used"] == arch["n_expert_used"]):
+            for ds, c in rand_counts.items():
+                publish_ds = _publish_dataset_label(ds)
+                per_ds_counts.setdefault(publish_ds, c)
+
+    if arch is None or len(per_ds_counts) < 2:
+        return 0.0
+
+    preferred_order = ["BBH", "HumanEval", "INCLUDE", "MMLU", "PopQA",
+                        "Random"]
+    labels = [d for d in preferred_order if d in per_ds_counts]
+    labels += [d for d in sorted(per_ds_counts.keys()) if d not in labels]
+    counts_list = [per_ds_counts[d] for d in labels]
+
+    js_mat = _layer_averaged_js_divergence_matrix(counts_list)
+    return float(js_mat.max())
+
+
+def _compute_cross_quant_jsd_max(model_dir: Path) -> float:
+    """Compute the cross-quant JSD matrix for one model and return its max.
+
+    Symmetric counterpart to `_compute_dataset_cell_jsd_max`. Returns
+    0.0 if the model has no usable quants.
+    """
+    model_dir = model_dir.resolve()
+    items = _iter_quant_overviews(model_dir)
+    if len(items) < 2:
+        return 0.0
+
+    per_quant_counts: dict[str, np.ndarray] = {}
+    arch: dict[str, Any] | None = None
+    for q_label, counts, a in items:
+        if arch is None:
+            arch = a
+        elif (a["n_layer"] != arch["n_layer"]
+              or a["n_expert"] != arch["n_expert"]
+              or a["n_expert_used"] != arch["n_expert_used"]):
+            continue
+        publish_q = _publish_quant_label(q_label)
+        per_quant_counts[publish_q] = counts
+
+    if arch is None or len(per_quant_counts) < 2:
+        return 0.0
+
+    quant_priority = [
+        "FP8", "BF16", "F16", "F32",
+        "Q8_0", "Q8_K", "Q6_K", "Q6_0", "Q6_K_S",
+        "Q5_1", "Q5_K_M", "Q5_K_S", "Q5_0",
+        "Q4_1", "Q4_K_M", "Q4_K_S", "Q4_0",
+        "Q3_K_L", "Q3_K_M", "Q3_K_S",
+        "Q2_K", "Q2_K_S",
+    ]
+    labels = [q for q in quant_priority if q in per_quant_counts]
+    labels += [q for q in sorted(per_quant_counts.keys())
+               if q not in labels]
+    counts_list = [per_quant_counts[q] for q in labels]
+
+    js_mat = _layer_averaged_js_divergence_matrix(counts_list)
+    return float(js_mat.max())
+
+
 def _process_one_dataset_cell(
         cell_dir: Path, *, output_dir: Path,
         width_in: float, dpi: int, cmap: str,
@@ -928,6 +1040,7 @@ def _process_one_dataset_cell(
         force: bool = False,
         per_cell: bool = False,
         jsd_cmap: str = DEFAULT_JSD_CMAP,
+        jsd_vmax: float | None = None,
         ) -> dict[str, Any]:
     """Process one (model, quant) cell for cross-dataset top-K Jaccard.
 
@@ -1100,6 +1213,7 @@ def _process_one_dataset_cell(
             js_mat, labels,
             width_in=jsd_width, height_in=jsd_height, dpi=dpi,
             cmap=jsd_cmap,
+            vmax=(jsd_vmax if jsd_vmax is not None else 1.0),
         )
         fig.savefig(js_png, dpi=dpi, bbox_inches="tight")
         plt.close(fig)
@@ -1180,6 +1294,7 @@ def _process_one_cross_quant(
         model_id: str | None = None,
         force: bool = False,
         jsd_cmap: str = DEFAULT_JSD_CMAP,
+        jsd_vmax: float | None = None,
         ) -> dict[str, Any]:
     """Process one model directory for cross-quant Jaccard heatmap."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1290,6 +1405,7 @@ def _process_one_cross_quant(
             js_mat, labels,
             width_in=jsd_width, height_in=jsd_height, dpi=dpi,
             cmap=jsd_cmap,
+            vmax=(jsd_vmax if jsd_vmax is not None else 1.0),
         )
         fig.savefig(js_png, dpi=dpi, bbox_inches="tight")
         plt.close(fig)
@@ -1440,13 +1556,15 @@ def main() -> int:
     parser.add_argument("--jsd-cmap", type=str, default=DEFAULT_JSD_CMAP,
                         help=f"Colormap for the JS-divergence heatmaps "
                              f"(default: {DEFAULT_JSD_CMAP}). The default "
-                             f"is `viridis` oriented with dark purple = low "
-                             f"divergence, teal = mid, bright yellow = high. "
-                             f"Alternatives include `viridis_r` (opposite "
-                             f"direction), `magma_r`, `inferno_r`, "
-                             f"`cividis`. Try a different one if the "
-                             f"small-value variations are hard to see in "
-                             f"your specific dataset.")
+                             f"is `Blues_r` so the diagonal (v=0, perfect "
+                             f"agreement) renders dark blue with white text "
+                             f"— matching the Jaccard heatmaps (`Blues`) "
+                             f"where the diagonal (v=1, perfect agreement) "
+                             f"also renders dark blue. Visual coherence "
+                             f"between the two views: dark blue = "
+                             f"\"same pair\" regardless of metric. "
+                             f"Alternatives: `Blues` (reversed direction), "
+                             f"`viridis`, `magma`, `cividis`.")
     parser.add_argument("--width-in", type=float, default=DEFAULT_WIDTH_IN,
                         help=f"Figure width in inches "
                              f"(default: {DEFAULT_WIDTH_IN}).")
@@ -1480,13 +1598,20 @@ def main() -> int:
             out_dir = args.cell_dir.resolve() / "paper_heatmaps"
         else:
             out_dir = args.output_dir
+        # Single-cell pre-pass: use the cell's own JSD max as vmax
+        # (so single-cell mode produces the same auto-scaled output as
+        # multi-mode would for a one-cell results set).
+        local_max = _compute_dataset_cell_jsd_max(args.cell_dir)
+        jsd_vmax = max(1e-4, local_max)
+        print(f"[plan] single-cell JSD vmax={jsd_vmax:.4f} "
+              f"(auto-scaled to this cell's data range)")
         res = _process_one_dataset_cell(
             args.cell_dir, output_dir=out_dir,
             width_in=args.width_in, dpi=args.dpi, cmap=args.cmap,
             k_min=args.k_min, k_max_frac=args.k_max_frac,
             num_ks=args.num_ks, model_id=args.model_id, quant=args.quant,
             force=args.force, per_cell=args.per_cell,
-            jsd_cmap=args.jsd_cmap,
+            jsd_cmap=args.jsd_cmap, jsd_vmax=jsd_vmax,
         )
         print(f"[done] {res}")
         return 0
@@ -1496,12 +1621,17 @@ def main() -> int:
             out_dir = args.model_dir.resolve() / "paper_heatmaps"
         else:
             out_dir = args.output_dir
+        # Single-model pre-pass: use the model's own JSD max as vmax.
+        local_max = _compute_cross_quant_jsd_max(args.model_dir)
+        jsd_vmax = max(1e-4, local_max)
+        print(f"[plan] single-model JSD vmax={jsd_vmax:.4f} "
+              f"(auto-scaled to this model's data range)")
         res = _process_one_cross_quant(
             args.model_dir, output_dir=out_dir,
             width_in=args.width_in, dpi=args.dpi, cmap=args.cmap,
             k_min=args.k_min, k_max_frac=args.k_max_frac,
             num_ks=args.num_ks, model_id=args.model_id, force=args.force,
-            jsd_cmap=args.jsd_cmap,
+            jsd_cmap=args.jsd_cmap, jsd_vmax=jsd_vmax,
         )
         print(f"[done] {res}")
         return 0
@@ -1523,66 +1653,107 @@ def main() -> int:
     n_models = 0
     n_model_failures = 0
 
+    # ---- pre-pass: compute every JSD matrix (cross-dataset + cross-quant)
+    # so we can take a single GLOBAL max across all of them. The user
+    # explicitly asked for this: "the largest JSD value from the
+    # results set... as the max value of the colormap scale of all
+    # the JSD plots". Every JSD plot then uses that single max as its
+    # `vmax`, so the colorbars are directly comparable across the
+    # paper.
+    all_jsd_maxes: list[float] = []
+    cell_jsd_maxes: list[tuple[Path, str | None, str | None, float]] = []
+    model_jsd_maxes: list[tuple[Path, str, float]] = []
+
+    cells: list[tuple[Path, str | None, str | None]] = []
     if not args.skip_cross_dataset:
         cells = _iter_cells_multi(results_dir, args.models, args.quants)
         if cells:
             print(f"[plan] {len(cells)} cell(s) for cross-dataset view")
             for cell_dir, model_id, quant in cells:
-                # Output one subdirectory per model (so models with
-                # many quants don't drown out small ones).
-                cell_out = out_dir / _safe_filename(
-                    model_id or _reverse_model_safe(cell_dir.parent.name)
+                local_max = _compute_dataset_cell_jsd_max(cell_dir)
+                cell_jsd_maxes.append(
+                    (cell_dir, model_id, quant, local_max)
                 )
-                cell_out.mkdir(parents=True, exist_ok=True)
-                print(f"\n[cell] {cell_dir}  (model={model_id}, quant={quant})")
-                try:
-                    r = _process_one_dataset_cell(
-                        cell_dir, output_dir=cell_out,
-                        width_in=args.width_in, dpi=args.dpi,
-                        cmap=args.cmap,
-                        k_min=args.k_min, k_max_frac=args.k_max_frac,
-                        num_ks=args.num_ks,
-                        model_id=model_id, quant=quant,
-                        force=args.force, per_cell=args.per_cell,
-                        jsd_cmap=args.jsd_cmap,
-                    )
-                    n_cells += 1
-                    if r.get("skipped"):
-                        print(f"[skip-cell] reason={r.get('reason')}")
-                except SystemExit:
-                    raise
-                except Exception as e:  # noqa: BLE001
-                    print(f"[error] {cell_dir}: {e}", file=sys.stderr)
-                    n_cell_failures += 1
+                if local_max > 0:
+                    all_jsd_maxes.append(local_max)
         else:
             print(f"[plan] no cells found under {results_dir}")
 
+    models: list[tuple[Path, str]] = []
     if not args.skip_cross_quant:
         models = _iter_models_multi(results_dir, args.models)
         if models:
             print(f"\n[plan] {len(models)} model(s) for cross-quant view")
             for model_dir, model_id in models:
-                model_out = out_dir / _safe_filename(model_id)
-                model_out.mkdir(parents=True, exist_ok=True)
-                print(f"\n[model] {model_dir}  (model_id={model_id})")
-                try:
-                    r = _process_one_cross_quant(
-                        model_dir, output_dir=model_out,
-                        width_in=args.width_in, dpi=args.dpi,
-                        cmap=args.cmap,
-                        k_min=args.k_min, k_max_frac=args.k_max_frac,
-                        num_ks=args.num_ks,
-                        model_id=model_id, force=args.force,
-                        jsd_cmap=args.jsd_cmap,
-                    )
-                    n_models += 1
-                    if r.get("skipped"):
-                        print(f"[skip-model] reason={r.get('reason')}")
-                except SystemExit:
-                    raise
-                except Exception as e:  # noqa: BLE001
-                    print(f"[error] {model_dir}: {e}", file=sys.stderr)
-                    n_model_failures += 1
+                local_max = _compute_cross_quant_jsd_max(model_dir)
+                model_jsd_maxes.append((model_dir, model_id, local_max))
+                if local_max > 0:
+                    all_jsd_maxes.append(local_max)
+
+    # Floor at 1e-4 so degenerate (all-zeros) matrices still get a
+    # sensible colormap range.
+    if all_jsd_maxes:
+        global_jsd_vmax = max(1e-4, max(all_jsd_maxes))
+    else:
+        global_jsd_vmax = 1.0
+    print(f"[plan] GLOBAL JSD vmax={global_jsd_vmax:.4f} "
+          f"(across {len(all_jsd_maxes)} JSD matrix/matrices in the "
+          f"results set; same scale applied to every JSD plot)")
+
+    if cells:
+        for cell_dir, model_id, quant, _local_max in cell_jsd_maxes:
+            # Output one subdirectory per model (so models with
+            # many quants don't drown out small ones).
+            cell_out = out_dir / _safe_filename(
+                model_id or _reverse_model_safe(cell_dir.parent.name)
+            )
+            cell_out.mkdir(parents=True, exist_ok=True)
+            print(f"\n[cell] {cell_dir}  (model={model_id}, quant={quant})")
+            try:
+                r = _process_one_dataset_cell(
+                    cell_dir, output_dir=cell_out,
+                    width_in=args.width_in, dpi=args.dpi,
+                    cmap=args.cmap,
+                    k_min=args.k_min, k_max_frac=args.k_max_frac,
+                    num_ks=args.num_ks,
+                    model_id=model_id, quant=quant,
+                    force=args.force, per_cell=args.per_cell,
+                    jsd_cmap=args.jsd_cmap,
+                    jsd_vmax=global_jsd_vmax,
+                )
+                n_cells += 1
+                if r.get("skipped"):
+                    print(f"[skip-cell] reason={r.get('reason')}")
+            except SystemExit:
+                raise
+            except Exception as e:  # noqa: BLE001
+                print(f"[error] {cell_dir}: {e}", file=sys.stderr)
+                n_cell_failures += 1
+
+    if models:
+        for model_dir, model_id, _local_max in model_jsd_maxes:
+            model_out = out_dir / _safe_filename(model_id)
+            model_out.mkdir(parents=True, exist_ok=True)
+            print(f"\n[model] {model_dir}  (model_id={model_id})")
+            try:
+                r = _process_one_cross_quant(
+                    model_dir, output_dir=model_out,
+                    width_in=args.width_in, dpi=args.dpi,
+                    cmap=args.cmap,
+                    k_min=args.k_min, k_max_frac=args.k_max_frac,
+                    num_ks=args.num_ks,
+                    model_id=model_id, force=args.force,
+                    jsd_cmap=args.jsd_cmap,
+                    jsd_vmax=global_jsd_vmax,
+                )
+                n_models += 1
+                if r.get("skipped"):
+                    print(f"[skip-model] reason={r.get('reason')}")
+            except SystemExit:
+                raise
+            except Exception as e:  # noqa: BLE001
+                print(f"[error] {model_dir}: {e}", file=sys.stderr)
+                n_model_failures += 1
         else:
             print(f"[plan] no models with >=2 quants under {results_dir}")
 

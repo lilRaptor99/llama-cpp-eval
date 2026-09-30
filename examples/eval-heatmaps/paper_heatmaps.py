@@ -266,6 +266,83 @@ def _publish_quant_label(quant_dir_name: str) -> str:
     return quant_dir_name
 
 
+def _safe_json_load(json_path: Path) -> dict[str, Any] | None:
+    """Load a JSON file robustly, recovering from partial UTF-8 / format
+    corruption that the C++ binary leaves behind after a kill.
+
+    Tries four strategies in order of speed, returning the first that
+    yields a parseable dict:
+
+      1. Strict `json.load` (fast path for uncorrupted files)
+      2. UTF-8 with `errors='replace'` — replaces invalid byte
+         sequences (e.g. truncated mid-codepoint) with U+FFFD so the
+         rest of the file can still be parsed as valid JSON. This
+         handles the most common corruption mode we see in the wild:
+         a few bytes of an otherwise-valid UTF-8 stream are invalid
+         (typically caused by an interrupted write that left the
+         output buffer in an inconsistent state).
+      3. `raw_decode` — locates the byte position where strict parsing
+         first fails, truncates the text there, and retries. This
+         handles files that crashed MID-TOKEN (e.g. mid-array, mid-
+         string, mid-number) and never wrote a closing brace.
+      4. As 3 but with `errors='replace'` first, so a UTF-8 hiccup
+         early in the file doesn't block recovery of the valid suffix.
+
+    Returns the parsed dict on success, or `None` if all four
+    strategies fail (caller should `[warn]` and skip).
+    """
+    # ---- Strategy 1: strict parse
+    try:
+        with open(json_path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError, OSError):
+        pass
+
+    # Read the bytes once so strategies 2-4 share the work.
+    try:
+        with open(json_path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    if not raw:
+        return None
+
+    # ---- Strategy 2: lenient UTF-8 (handles a few bad bytes)
+    try:
+        text = raw.decode("utf-8", errors="replace")
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # ---- Strategy 3: raw_decode + truncate at failure (handles
+    # truncated files). Retry with progressively shorter prefixes.
+    decoder = json.JSONDecoder()
+    # Try `raw_decode` first to find where parsing breaks; then
+    # truncate and retry to recover whatever was successfully written
+    # before the crash. Loop so a successful parse of the prefix
+    # overrides an earlier parse failure of the suffix.
+    for text in (raw.decode("utf-8", errors="replace"),
+                 raw.decode("utf-8", errors="ignore")):
+        end = len(text)
+        while end > 0:
+            try:
+                obj, _idx = decoder.raw_decode(text[:end])
+                if isinstance(obj, dict):
+                    return obj
+                # JSON parsed but it's not an object — keep trying
+                # shorter prefixes.
+                end = _idx - 1
+                continue
+            except json.JSONDecodeError:
+                end -= 1
+                # Avoid thrashing on huge files: only try up to 1024
+                # backtracks before giving up.
+                if len(text) - end > 1024:
+                    break
+        # Try the next lenient UTF-8 decoding strategy.
+    return None
+
+
 def _top_k_set_for_layer(counts: np.ndarray, layer: int, K: int) -> set[int]:
     """Return the top-K expert IDs in `counts[layer]`, ties -> asc id.
 
@@ -750,9 +827,17 @@ def _load_one_dataset_counts(json_path: Path
     `arch` is a dict with keys `name`, `n_layer`, `n_expert`,
     `n_expert_used`. On missing `aggregate` block we raise ValueError
     (callers should skip with a `[warn]`).
+
+    Uses `_safe_json_load` to recover from partial UTF-8 / format
+    corruption that the C++ binary leaves behind when killed mid-
+    write — see that helper's docstring for the recovery strategies.
+    If even the lenient loader fails, we raise ValueError so callers
+    can `[warn]` and skip.
     """
-    with open(json_path) as f:
-        data = json.load(f)
+    data = _safe_json_load(json_path)
+    if data is None:
+        raise ValueError(f"unable to load JSON (file too corrupted) "
+                         f"from {json_path}")
     arch_in = data.get("model_arch", {})
     L = int(arch_in.get("n_layer", 0))
     E = int(arch_in.get("n_expert", 0))
@@ -782,9 +867,14 @@ def _load_one_quant_overview(json_path: Path
                               ) -> tuple[dict[str, Any], np.ndarray, int]:
     """Load one `<model>/<quant>/overall/counts_total_overview.json` and
     return `(arch, counts_total[L,E], tokens_total)`.
+
+    Uses `_safe_json_load` to recover from partial corruption — same
+    recovery strategies (strict → lenient UTF-8 → raw_decode truncate).
     """
-    with open(json_path) as f:
-        data = json.load(f)
+    data = _safe_json_load(json_path)
+    if data is None:
+        raise ValueError(f"unable to load JSON (file too corrupted) "
+                         f"from {json_path}")
     arch_in = data.get("model_arch") or {}
     L = int(arch_in.get("n_layer", 0))
     E = int(arch_in.get("n_expert", 0))
@@ -862,16 +952,14 @@ def _maybe_aggregate_random(cell_dir: Path
     n_tokens = 0
     n_rows = 0
     for jp in random_jsons:
-        try:
-            with open(jp) as f:
-                data = json.load(f)
-        except (json.JSONDecodeError, UnicodeDecodeError, ValueError, OSError) as e:
-            # `UnicodeDecodeError` is a sibling of `json.JSONDecodeError`
-            # (both inherit from `ValueError`) but is NOT a subclass of
-            # it, so we list it explicitly. Same rationale as the
-            # catch in `aggregate_overview.py`: partially-flushed
-            # JSONs should be skipped gracefully, not crash the run.
-            print(f"[warn] {jp}: {e}; skipping from Random aggregate")
+        # `_safe_json_load` recovers from partially-flushed JSONs
+        # (UTF-8 with invalid byte sequences, truncated mid-array,
+        # etc.) so a few corrupt bytes in one random baseline file
+        # don't blacklist the whole Random aggregate.
+        data = _safe_json_load(jp)
+        if data is None:
+            print(f"[warn] {jp}: unable to load JSON (corrupted beyond "
+                  f"recovery); skipping from Random aggregate")
             continue
         a_in = data.get("model_arch") or {}
         L = int(a_in.get("n_layer", 0))

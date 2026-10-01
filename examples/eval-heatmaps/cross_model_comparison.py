@@ -106,6 +106,10 @@ DEFAULT_MODELS: list[tuple[str, str]] = [
     ("LiteLLMs--Mixtral-8x22B-Instruct-v0.1-GGUF",   "Mixtral-8x22B"),
     ("mradermacher--deepseek-moe-16b-chat-GGUF",      "DeepSeek-MoE-16B"),
     ("unsloth--Qwen3-30B-A3B-GGUF",                   "Qwen3-30B-A3B"),
+    ("allenai--OLMoE-1B-7B-0924-Instruct",       "OLMoE-1B-7B"),
+    ("mistralai--Mixtral-8x22B-Instruct-v0.1",   "Mixtral-8x22B"),
+    ("deepseek-ai--deepseek-moe-16b-chat",      "DeepSeek-MoE-16B"),
+    ("Qwen--Qwen3-30B-A3B",                   "Qwen3-30B-A3B"),
 ]
 
 # Default benchmark order (publishable label form). `Random` is appended

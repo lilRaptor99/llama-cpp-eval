@@ -363,6 +363,97 @@ The figure script (`cross_model_comparison.py`) and the table script
 and the same `BENCHMARK_ORDER` — both are kept in sync by convention
 (make the same edit in both files if you want to change the model set).
 
+### Cross-quantization comparison figure (sibling peer)
+
+The companion figure to `cross_model_comparison.py` answers the
+**same question but along the quantization axis**: for each model,
+how stable is the routing distribution across quantizations?
+The script generates a single **2×N figure** where columns are
+models and each subplot is that model's N_q×N_q cross-quantization
+Jaccard (top row) or JSD (bottom row) matrix. Together with the
+cross-model figure, reviewers can see at a glance whether
+quantisation affects routing uniformly across models or only
+some. The script is `examples/eval-heatmaps/cross_quantization_comparison.py`:
+
+```sh
+# Default run (4 hardcoded models, all available quants):
+python examples/eval-heatmaps/cross_quantization_comparison.py
+
+# Restrict to a subset of models:
+python examples/eval-heatmaps/cross_quantization_comparison.py \
+    --models allenai--OLMoE-1B-7B-0125-Instruct-GGUF \
+    --models unsloth--Qwen3-30B-A3B-GGUF
+
+# Restrict to a subset of quants (e.g. just Q2_K vs Q4_K_M):
+python examples/eval-heatmaps/cross_quantization_comparison.py \
+    --quants Q2_K --quants Q4_K_M
+```
+
+Layout:
+
+```
+    [OLMoE-1B ][Mixtral ][DeepSeek][Qwen3  ]   <- column titles (top)
+    [ N_q x N_q Jaccard heatmap per model       ]   <- 1 shared colorbar (0..1)
+    [ N_q x N_q JSD     heatmap per model       ]   <- 1 shared colorbar (0..auto vmax)
+```
+
+`N_q` is the number of valid quantisations discovered per model
+(typically 2–4: `Q2_K`, `Q4_K_M`, optionally `Q8_0` / `F16` / `F32`,
+plus the `UniformRand` baseline when `<model>/RANDOM/overall/...`
+exists). Models with different `N_q` still appear in the same figure
+— cell sizes vary modestly across models (small `N_q` → bigger
+cells, large `N_q` → smaller cells), which is fine for a
+cross-model comparison.
+
+- **Square cells** (`aspect="equal"`), tight gaps (`wspace=0.02`,
+  `hspace=0.08`) — same convention as `cross_model_comparison.py`.
+- **Short model names** as column titles (`OLMoE-1B-7B`,
+  `Mixtral-8x22B`, `DeepSeek-MoE-16B`, `Qwen3-30B-A3B`) — same
+  short names as `cross_model_comparison.py`.
+- **`UniformRand` (uniform random router) baseline** is included as
+  one of the `N_q` quants when its `RANDOM/` directory is present.
+- **Quant labels sorted by `QUANT_PRIORITY`** (most-precise first:
+  `F32`, `F16`, `BF16`, `FP8`, then descending by aggressiveness
+  `Q8_0 → Q2_K`).
+- **Tick labels only on leftmost column and bottom row** to save
+  horizontal space; full labels go in the caption.
+- **Jaccard colorbar: 0–1 (fixed)** — bounded metric, so the same
+  scale applies across all models.
+- **JSD colorbar: 0 to global max across ALL models' cross-quant
+  matrices** (matches the global pre-pass in `paper_heatmaps.py`),
+  so reviewers can compare cells across the paper without
+  re-scaling. Pass `--jsd-vmax 1.0` to fall back to the canonical
+  fixed `[0, 1]` range.
+- **No CSV outputs** — single-responsibility script: figure only.
+  The companion table is `cross_quantization_table.py` (see
+  "Cross-quantization table" section above); the per-model
+  single-figure views are produced by `paper_heatmaps.py`
+  (`<model>__<quant>__jaccard_quant.png` /
+  `<model>__js_divergence_quant.png`).
+
+Output (under `<output-dir>/`, default
+`<results-dir>/paper_heatmaps/cross_quantization/`):
+
+- `cross_quantization_grid.png`     — the 2×N figure
+
+The CLI:
+
+| Flag            | Meaning                                                       | Default                                                |
+| --------------- | ------------------------------------------------------------- | ------------------------------------------------------ |
+| `--results-dir` | Root results directory (multi-model batch mode).              | `/mnt/data/results-llama-cpp`                          |
+| `--models`      | Restrict to a subset of filesystem-safe model ids (repeatable). | (the 4 hardcoded defaults in `DEFAULT_MODELS`)        |
+| `--quants`      | Restrict to a subset of quant subdirectories (repeatable).    | (all quants with valid `counts_total_overview.json`)   |
+| `--output-dir`  | Output directory.                                             | `<results-dir>/paper_heatmaps/cross_quantization`      |
+| `--width-in`    | Figure width in inches.                                       | `11.0` (double-column paper)                           |
+| `--height-in`   | Figure height in inches.                                      | `5.5` (2 rows × N model columns + colorbars)           |
+| `--dpi`         | Output DPI.                                                   | `300`                                                  |
+| `--jsd-vmax`    | JSD colorbar vmax (default: auto from all models' matrices).  | auto                                                   |
+
+The figure script (`cross_model_comparison.py`) and this one share
+the same `DEFAULT_MODELS` list — both are kept in sync by convention
+(make the same edit in both files if you want to change the model
+set).
+
 ## Customizing labels
 
 `_DATASET_PUBLISH_LABELS` (top of `paper_heatmaps.py`) maps each

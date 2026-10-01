@@ -33,10 +33,10 @@ export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-${HF_CACHE_DIR}}"
 # Hardcoded HF MoE GGUF repos. Edit freely; each -hf <id> invocation
 # will download + cache the GGUF on first use.
 readonly DEFAULT_MODELS=(
-    "unsloth/Qwen3-30B-A3B-GGUF"
-    #"mradermacher/OLMoE-1B-7B-0924-Instruct-GGUF"
-    # "mradermacher/deepseek-moe-16b-chat-GGUF"
-    # "LiteLLMs/Mixtral-8x22B-Instruct-v0.1-GGUF"
+    # "unsloth/Qwen3-30B-A3B-GGUF"
+    "mradermacher/OLMoE-1B-7B-0924-Instruct-GGUF"
+    "mradermacher/deepseek-moe-16b-chat-GGUF"
+    "LiteLLMs/Mixtral-8x22B-Instruct-v0.1-GGUF"
 )
 
 # --------------------------------------------------------- defaults / state

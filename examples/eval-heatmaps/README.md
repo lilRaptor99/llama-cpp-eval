@@ -260,15 +260,12 @@ in each filename embeds the `--quant` value so running the script
 with multiple quantizations doesn't overwrite each other and a
 reviewer opening a file knows immediately which quantization it is):
 
-- `cross_model_grid__<quant>.png`    the 2×4 figure
-- `cross_model_jaccard__<quant>.csv` 5×5 / 6×6 Jaccard matrices per model
-                                        (long-form)
-- `cross_model_jsd__<quant>.csv`     5×5 / 6×6 JSD matrices per model
-                                        (long-form)
-- `cross_model_summary__<quant>.csv` per-model aggregate stats:
-                                        mean / min / max off-diagonal
-                                        Jaccard & JSD, K_model, n_layer,
-                                        n_expert, etc.
+- `cross_model_grid__<quant>.png`    the 2×4 figure (1 row per metric,
+                                       1 column per model)
+
+The cross-quantization **summary table** is produced by the sibling
+script `cross_quantization_table.py` (run separately) — see the
+"Cross-quantization table" section below.
 
 The figure uses:
 - **Jaccard colorbar: 0–1 (fixed)** — both metrics are bounded in [0,1]
@@ -301,21 +298,70 @@ The figure uses:
   the original `wspace=0.25, hspace=0.55` as too generous and asked
   to tighten.
 
-The CLI mirrors `paper_heatmaps.py`:
+### Cross-quantization table (companion to the figure)
 
-| Flag            | Meaning                                                        | Default                       |
-| --------------- | -------------------------------------------------------------- | ----------------------------- |
-| `--results-dir` | Root results directory (multi-cell results tree).              | `/mnt/data/results-llama-cpp` |
-| `--quant`       | Quantization subdirectory to use for all models.               | `Q4_K_M`                      |
-| `--models`      | Restrict to a subset of filesystem-safe model ids.             | (all 4 hardcoded defaults)    |
-| `--output-dir`  | Output directory.                                              | `<results-dir>/paper_heatmaps/cross_model` |
-| `--width-in`    | Figure width in inches.                                        | `11.0` (double-column)        |
-| `--height-in`   | Figure height in inches.                                       | `5.5`                         |
-| `--dpi`         | Output DPI.                                                    | `300`                         |
+The figure shows routing similarity across datasets, **at one
+quantization** (`--quant`). The companion table summarises routing
+similarity across **all available quantizations** for each model.
+Together they answer:
+
+- *figure*: at Q4_K_M, how similar is BBH routing to MMLU routing?
+- *table*: when we compare Q2_K vs Q4_K_M routing distributions,
+  does the routing similarity between BBH and MMLU change much?
+
+The table is produced by a **separate script**,
+`examples/eval-heatmaps/cross_quantization_table.py`, so the figure
+script stays focused on the heatmap (single responsibility, easier
+to test in isolation). Run it separately:
+
+```sh
+python examples/eval-heatmaps/cross_quantization_table.py \
+    --results-dir /mnt/data/results-llama-cpp
+```
+
+**Table caption** (also embedded as the header of the saved `.txt`
+file so reviewers don't have to open this README to make sense of
+the numbers):
+
+> **Table N: Cross-quantisation stability of routing similarity.**
+> For each (model, metric, dataset) cell, the value reports the
+> mean ± std of the metric across all available quantisations of
+> that model. The per-quant "metric value" is the mean of the
+> metric's row in that quant's cross-dataset pairwise matrix,
+> excluding the diagonal — i.e. how similar this dataset's routing
+> distribution is to the average of all OTHER datasets in this
+> quant. Rows are organised as (model, metric) pairs; columns are
+> dataset labels. `n_quants` reports the number of quantisations that
+> contributed (the `RANDOM` quant is skipped because its label set
+> lacks the `UniformRand` row). Low `std` indicates that the
+> cross-dataset routing similarity for this dataset is stable across
+> quantisations; high `std` indicates that quantisation meaningfully
+> affects the routing distribution.
+
+**Reading the table**: a low `std` means routing for this dataset is
+stable across quantizations (the same experts fire). A high `std`
+means quantization meaningfully affects the routing distribution.
+The script does NOT depend on `--quant` because it summarises across
+**all** quants for each model — running with `--quant Q2_K` vs
+`--quant Q6_K` produces the same table. The CSV/TXT filenames
+therefore have no quant suffix.
+
+The CLI for `cross_quantization_table.py`:
+
+| Flag            | Meaning                                                        | Default                                                  |
+| --------------- | -------------------------------------------------------------- | -------------------------------------------------------- |
+| `--results-dir` | Root results directory (multi-cell results tree).              | `/mnt/data/results-llama-cpp`                            |
+| `--models`      | Restrict to a subset of filesystem-safe model ids.             | (all 4 hardcoded defaults)                                |
+| `--output-dir`  | Output directory.                                              | `<results-dir>/paper_heatmaps/cross_quantization`        |
 
 To customize the model set, edit the `DEFAULT_MODELS` list at the top
-of `cross_model_comparison.py` (filesystem-safe model id → short name
+of `cross_quantization_table.py` (filesystem-safe model id → short name
 mapping).
+
+The figure script (`cross_model_comparison.py`) and the table script
+(`cross_quantization_table.py`) share the same `DEFAULT_MODELS` list
+and the same `BENCHMARK_ORDER` — both are kept in sync by convention
+(make the same edit in both files if you want to change the model set).
 
 ## Customizing labels
 

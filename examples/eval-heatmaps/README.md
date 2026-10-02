@@ -231,6 +231,62 @@ results tree is cheap. Pass `--force` to regenerate.
 If the cross-quant step fails with `[skip] <quant>/overall/counts_total_overview.json:
 not found`, you forgot step 2.
 
+## Paper-quality jaccard_global K-sweep (per cell)
+
+The 120 DPI `jaccard_sweep_from_cpp.py::jaccard_global.png` plots
+two metrics (generalized |∩|/|∪| + mean pairwise Jaccard) overlaid
+on a single plot with a multi-line title, grid, and legend. The
+paper-quality counterpart `paper_jaccard_global_sweep.py` (single
+script in this directory) re-renders the same view as a clean
+**2-row × 1-col figure** (300 DPI, no titles, no grid):
+
+```
+    [ generalized |∩|/|∪|    (strict consensus)        ]
+    [ mean pairwise Jaccard   (smoother average)        ]
+                  K  ->
+```
+
+Stacking the two metrics makes the relationship between strict
+consensus and pairwise agreement immediately visible (the strict
+curve is always ≤ the pairwise curve by definition, and the gap
+grows as the datasets diverge). The shared K axis removes
+redundant labeling. The `K_model` vertical marker and the `y = 1.0`
+reference line are kept so the reader can immediately locate the
+operating point and the perfect-agreement upper bound.
+
+Usage (one cell at a time — single-cell CLI matches the existing
+`jaccard_sweep_from_cpp.py` semantics):
+
+```sh
+python examples/eval-heatmaps/paper_jaccard_global_sweep.py \
+    --cell-dir /mnt/data/results-llama-cpp/allenai--OLMoE-1B-7B-0125-Instruct-GGUF/Q4_K_M
+```
+
+Output (under `<output-dir>/`, default `<cell-dir>/paper_jaccard_sweep/`):
+
+- `jaccard_global.png`     — the 2-row paper figure
+
+The CLI:
+
+| Flag            | Meaning                                                       | Default                                                |
+| --------------- | ------------------------------------------------------------- | ------------------------------------------------------ |
+| `--cell-dir`    | Single (model, quant) cell directory (required).              | (none)                                                 |
+| `--output-dir`  | Output directory.                                             | `<cell-dir>/paper_jaccard_sweep`                       |
+| `--width-in`    | Figure width in inches.                                       | `5.0` (single-column paper)                            |
+| `--height-in`   | Figure height in inches.                                      | `4.0` (2 stacked subplots + shared K axis)             |
+| `--dpi`         | Output DPI.                                                   | `300`                                                  |
+| `--k-min`       | Minimum K in the sweep.                                       | `1`                                                    |
+| `--k-max-frac`  | `K_max = ceil(n_expert * k_max_frac)`.                        | `0.50`                                                 |
+| `--num-ks`      | Number of K values in the linear sweep.                       | `21`                                                   |
+| `--force`       | Re-render even if the output PNG already exists.              | off                                                    |
+
+Only the 5 real benchmarks (BBH / HumanEval / INCLUDE / MMLU /
+PopQA) are compared — the script loads `moe-*/expert_counts.json`
+exactly the way `jaccard_sweep_from_cpp.py` does, so the curves
+are bit-identical to the existing 120 DPI overview (modulo
+per-layer averaging). The optional `UniformRand` baseline is
+filtered out.
+
 ## Cross-model comparison figure (for the paper)
 
 The script `cross_model_comparison.py` is a sibling peer of

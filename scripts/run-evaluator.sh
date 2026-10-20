@@ -34,9 +34,11 @@ export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-${HF_CACHE_DIR}}"
 # will download + cache the GGUF on first use.
 readonly DEFAULT_MODELS=(
     # "unsloth/Qwen3-30B-A3B-GGUF"
-    "mradermacher/OLMoE-1B-7B-0924-Instruct-GGUF"
-    "mradermacher/deepseek-moe-16b-chat-GGUF"
-    "LiteLLMs/Mixtral-8x22B-Instruct-v0.1-GGUF"
+    # "mradermacher/OLMoE-1B-7B-0924-Instruct-GGUF"
+    "pratheeks/deepseek-moe-16b-chat-GGUF"
+    # "deepseek-ai/deepseek-moe-16b-chat" # DeepSeek BF16 original
+    # "mradermacher/deepseek-moe-16b-chat-GGUF"
+    # "LiteLLMs/Mixtral-8x22B-Instruct-v0.1-GGUF"
 )
 
 # --------------------------------------------------------- defaults / state

@@ -14,6 +14,12 @@ Layout:
     [ Jaccard row: 5x5 heatmap per model               ]   <- 1 colorbar
     [ JSD     row: 5x5 heatmap per model               ]   <- 1 colorbar
 
+JSD colorbar uses a **fixed [0, 0.5] scale** (the empirically
+observed largest possible divergence across the result histograms).
+This avoids the per-run global-max pre-pass and keeps every cross-
+model comparison on the identical scale without scanning every
+quantization cell first.
+
 The figure is sized for a double-column paper (~11in wide x ~5.5in tall),
 300 DPI, no titles / no axis labels beyond the model-name column
 titles — readers get the dataset labels (BBH / HumanEval / INCLUDE /
@@ -277,48 +283,6 @@ def _order_labels(counts: dict[str, np.ndarray]
     return labels, counts_list
 
 
-def _compute_global_jsd_max(results_dir: Path
-                             ) -> tuple[float, int]:
-    """Scan EVERY (model, quant) cell in `results_dir` and return the
-    global JSD max across all of them, plus the number of matrices
-    that contributed.
-
-    Mirrors the global pre-pass `paper_heatmaps.py::main()` does for
-    its in-script heatmaps: the user explicitly asked for the JSD
-    colorbar to use the SAME scale as the individual `paper_heatmaps.py`
-    PNGs so reviewers can compare cells across the paper without
-    re-scaling. That means we must scan ALL quants (not just the one
-    passed via `--quant`), since `paper_heatmaps.py`'s pre-pass does
-    the same.
-
-    Returns (max, n_matrices). Returns (1.0, 0) when no cell can be
-    loaded (the caller falls back to the trivial [0, 1] range).
-    """
-    all_maxes: list[float] = []
-    if not results_dir.is_dir():
-        return 1.0, 0
-    for mdir in sorted(p for p in results_dir.iterdir() if p.is_dir()):
-        # Skip non-cell dirs (e.g. `paper_heatmaps/` is the output of
-        # the per-cell script, not a results dir).
-        for qdir in sorted(p for p in mdir.iterdir() if p.is_dir()):
-            # Skip if there's no per-benchmark `moe-<ds>/expert_counts.json`
-            # data — these aren't real MoE-evaluation cells.
-            if not any(qdir.glob("moe-*/expert_counts.json")):
-                continue
-            try:
-                counts, _arch = _load_cell_counts(mdir, qdir.name)
-            except SystemExit:
-                continue
-            labels, counts_list = _order_labels(counts)
-            if len(counts_list) < 2:
-                continue
-            jsd = _layer_averaged_js_divergence_matrix(counts_list)
-            all_maxes.append(float(jsd.max()))
-    if not all_maxes:
-        return 1.0, 0
-    return max(1e-4, max(all_maxes)), len(all_maxes)
-
-
 # ------------------------------------------------------------------- plot
 
 def _draw_one_heatmap(ax, mat, labels, *, vmin, vmax, cmap,
@@ -528,7 +492,14 @@ def main() -> int:
             tick_label_fontsize=7,
             cell_text_fontsize=6,
         )
-        ax.set_title(short_name, fontsize=9, pad=4)
+        # Title combines the model name and the `--quant` value with a
+        # pipe separator (e.g. "OLMoE-1B-7B | Q4_K_M"). This makes
+        # every column independently labelled so the reader can pair
+        # the figure with any of the `--quant` outputs without
+        # consulting the file name; the same `__<quant>` suffix is
+        # already in the PNG file name, but duplicating it in the
+        # title is friendlier when the PNG is embedded in a slide.
+        ax.set_title(f"{short_name} | {args.quant}", fontsize=9, pad=4)
         # Hide x-tick labels (these are the dataset names, repeated on
         # all 4 subplots — save horizontal space; user requested row
         # titles in caption).
@@ -549,16 +520,14 @@ def main() -> int:
     cb_jacc.ax.yaxis.set_major_formatter(FuncFormatter(_format_v2))
     cb_jacc.set_ticks(np.linspace(0.0, 1.0, 6))
 
-    # JSD row: vmin=0, vmax = GLOBAL max across ALL cells in the
-    # results tree (not just the 4 models in this figure). This
-    # matches the scale `paper_heatmaps.py::main()` uses for its
-    # individual JSD heatmaps, so the per-cell PNGs and the cross-
-    # model grid are directly comparable on the same colorbar scale.
-    jsd_vmax, n_matrices = _compute_global_jsd_max(args.results_dir)
-    print(f"[plan] JSD shared colorbar range: 0 to {jsd_vmax:.4f} "
-          f"(global max across {n_matrices} JSD matrix/matrices in the "
-          f"results tree; same scale as the individual "
-          f"paper_heatmaps.py PNGs)")
+    # JSD row: fixed [0, 0.5] scale. The 0.5 upper bound is the
+    # empirically observed largest divergence across the result
+    # histograms (it comfortably covers every matrix we've seen so
+    # far), so we skip the expensive per-run global-max scan and
+    # keep every cross-model comparison on the identical scale.
+    print("[plan] JSD shared colorbar range: fixed 0 to 0.5 "
+          "(empirical max across all result histograms; no per-run "
+          "global scan needed)")
 
     jsd_axes = []
     jsd_im = None
@@ -570,7 +539,7 @@ def main() -> int:
         # get WHITE text. Diagonal (v=0) is dark blue with white text.
         im = _draw_one_heatmap(
             ax, data["jsd"], data["labels"],
-            vmin=0.0, vmax=jsd_vmax, cmap="Blues_r",
+            vmin=0.0, vmax=0.5, cmap="Blues_r",
             cell_text_format="{v:.3f}",
             cell_text_threshold=0.5,
             cell_text_color_above="black",
@@ -590,7 +559,7 @@ def main() -> int:
     cb_jsd.ax.tick_params(labelsize=7, length=0)
     cb_jsd.outline.set_visible(False)
     cb_jsd.ax.yaxis.set_major_formatter(FuncFormatter(_format_v3))
-    cb_jsd.set_ticks(np.linspace(0.0, jsd_vmax, 6))
+    cb_jsd.set_ticks(np.linspace(0.0, 0.5, 6))
 
     # ---- Step 4: save the figure.
     # Include `--quant` in the file name (a) so running this script

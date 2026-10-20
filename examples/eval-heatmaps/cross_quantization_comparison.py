@@ -25,6 +25,13 @@ subplot is sized so the cells fit; cell sizes vary modestly across
 models (small N_q → bigger cells, large N_q → smaller cells), which
 is fine for a cross-model comparison.
 
+JSD colorbar uses a **fixed [0, 0.5] scale** (the empirically
+observed largest possible divergence across the result histograms).
+This avoids the per-run global-max pre-pass and keeps every cross-
+model comparison on the identical scale without scanning every
+quantization cell first. Same convention as the sibling
+`cross_model_comparison.py` script.
+
 The figure is sized for a double-column paper (~11in × 5.5in), 300
 DPI, no titles / no axis labels beyond the model-name column titles
 — readers get the quant label interpretation from the figure caption,
@@ -102,14 +109,14 @@ DEFAULT_MODELS: list[tuple[str, str]] = [
     # (filesystem-safe model id, short name for the figure caption).
     # The filesystem-safe id is the directory name in the results tree
     # (slashes replaced with `--` per `scripts/run-evaluator.sh`).
-    ("allenai--OLMoE-1B-7B-0125-Instruct-GGUF",       "OLMoE-1B-7B"),
+    ("mradermacher--OLMoE-1B-7B-0924-Instruct-GGUF",       "OLMoE-1B-7B"),
     ("LiteLLMs--Mixtral-8x22B-Instruct-v0.1-GGUF",   "Mixtral-8x22B"),
     ("mradermacher--deepseek-moe-16b-chat-GGUF",      "DeepSeek-MoE-16B"),
     ("unsloth--Qwen3-30B-A3B-GGUF",                   "Qwen3-30B-A3B"),
-    ("allenai--OLMoE-1B-7B-0924-Instruct",       "OLMoE-1B-7B"),
-    ("mistralai--Mixtral-8x22B-Instruct-v0.1",   "Mixtral-8x22B"),
-    ("deepseek-ai--deepseek-moe-16b-chat",      "DeepSeek-MoE-16B"),
-    ("Qwen--Qwen3-30B-A3B",                   "Qwen3-30B-A3B"),
+    # ("allenai--OLMoE-1B-7B-0924-Instruct",       "OLMoE-1B-7B"),
+    # ("mistralai--Mixtral-8x22B-Instruct-v0.1",   "Mixtral-8x22B"),
+    # ("deepseek-ai--deepseek-moe-16b-chat",      "DeepSeek-MoE-16B"),
+    # ("Qwen--Qwen3-30B-A3B",                   "Qwen3-30B-A3B"),
 ]
 
 # Quant priority used for ordering rows/cols within each model's
@@ -269,41 +276,6 @@ def _compute_model_cross_quant_matrices(model_dir: Path,
     }
 
 
-def _compute_global_jsd_vmax(results_dir: Path,
-                              models: list[tuple[str, str]],
-                              only_quants: list[str] | None,
-                              ) -> tuple[float, int]:
-    """Scan every model's cross-quantization JSD matrix and return the
-    global max across all of them, plus the number of matrices that
-    contributed.
-
-    Mirrors the global pre-pass `paper_heatmaps.py::main()` does for
-    its in-script heatmaps: the user explicitly asked for the JSD
-    colorbar to use the SAME scale across all subplots in this
-    2×N figure so reviewers can compare cells across models without
-    re-scaling.
-
-    Returns (vmax, n_matrices). Falls back to (1.0, 0) when no cell
-    can be loaded.
-    """
-    all_maxes: list[float] = []
-    for model_safe, _short_name in models:
-        model_dir = results_dir / model_safe
-        if not model_dir.is_dir():
-            continue
-        data = _compute_model_cross_quant_matrices(model_dir, only_quants)
-        if data is None:
-            continue
-        jsd = data["jsd"]
-        # Ignore the (always-zero) diagonal.
-        off_diag = jsd[~np.eye(jsd.shape[0], dtype=bool)]
-        if off_diag.size:
-            all_maxes.append(float(off_diag.max()))
-    if not all_maxes:
-        return 1.0, 0
-    return max(1e-4, max(all_maxes)), len(all_maxes)
-
-
 # ------------------------------------------------------------------- plot
 
 def _draw_one_heatmap(ax, mat, labels, *, vmin, vmax, cmap,
@@ -392,12 +364,6 @@ def main() -> int:
         "--dpi", type=int, default=DPI,
         help=f"Output DPI (default: {DPI}).",
     )
-    parser.add_argument(
-        "--jsd-vmax", type=float, default=None,
-        help="Global JSD vmax for the colorbar (default: auto-computed "
-             "from the largest off-diagonal across ALL models' cross-"
-             "quant JSD matrices; pass an explicit value to override).",
-    )
     args = parser.parse_args()
 
     # Resolve the model set.
@@ -447,20 +413,14 @@ def main() -> int:
     if n_cols < 1:
         raise SystemExit("[error] need at least 1 model")
 
-    # ---- Step 2: compute the shared JSD vmax across all models.
-    if args.jsd_vmax is not None:
-        jsd_vmax = args.jsd_vmax
-        print(f"[plan] JSD shared colorbar range: 0 to {jsd_vmax:.4f} "
-              f"(user-supplied via --jsd-vmax)")
-    else:
-        jsd_vmax, n_matrices = _compute_global_jsd_vmax(
-            args.results_dir, models, args.quants
-        )
-        print(f"[plan] JSD shared colorbar range: 0 to {jsd_vmax:.4f} "
-              f"(global max across {n_matrices} cross-quant JSD "
-              f"matrix/matrices in the results tree; same scale as "
-              f"the per-cell paper_heatmaps.py PNGs so reviewers can "
-              f"compare cells across the paper without re-scaling)")
+    # ---- Step 2: shared JSD vmax is a fixed 0.5 (same convention as
+    # the sibling cross_model_comparison.py script and the empirically
+    # observed largest divergence across the result histograms). This
+    # avoids the per-run global-max scan.
+    jsd_vmax = 0.5
+    print("[plan] JSD shared colorbar range: fixed 0 to 0.5 "
+          "(empirical max across all result histograms; no per-run "
+          "global scan needed)")
 
     # ---- Step 3: figure layout (2 rows x n_cols cols).
     # Reserve right margin for the per-row colorbar. With n_cols

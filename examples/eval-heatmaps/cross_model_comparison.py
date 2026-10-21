@@ -122,7 +122,7 @@ DEFAULT_MODELS: list[tuple[str, str]] = [
 # at the END when the synthetic auto-aggregated baseline is present
 # (so the comparison reads naturally: real benchmarks first, baseline
 # at the bottom). The aggregator falls back to sorted order for any
-# dataset not in this list. The user renamed "Random" to "UniformRand"
+# dataset not in this list. The user renamed "Random" to "UnifRand"
 # for paper-clarity (it's a uniform random router baseline; the
 # short form is less ambiguous than "Random" which could be read as
 # "arbitrary baseline" by a casual reader).
@@ -263,9 +263,9 @@ def _load_cell_counts(model_dir: Path, quant: str
                     # `_maybe_aggregate_random` returns
                     # ``{"Random": agg}`` with the original (mixed-
                     # case) key — remap to our publishable label
-                    # "UniformRand" so it lines up with the
+                    # "UnifRand" so it lines up with the
                     # BENCHMARK_ORDER entry above. `setdefault` so
-                    # we don't clobber a real "Random" / "UniformRand"
+                    # we don't clobber a real "Random" / "UnifRand"
                     # cell entry if the user has one at the cell root.
                     counts.setdefault("UnifRand", c)
 

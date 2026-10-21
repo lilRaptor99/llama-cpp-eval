@@ -19,7 +19,7 @@ Layout:
 
 `N_q` is the number of valid quantisations discovered per model
 (typically 2–4: Q2_K, Q4_K_M, optionally Q8_0 / F16 / F32, plus the
-UniformRand baseline when `<model>/RANDOM/overall/...` exists).
+UnifRand baseline when `<model>/RANDOM/overall/...` exists).
 Models with different `N_q` still appear in the same figure — each
 subplot is sized so the cells fit; cell sizes vary modestly across
 models (small N_q → bigger cells, large N_q → smaller cells), which
@@ -134,8 +134,8 @@ QUANT_PRIORITY: list[str] = [
 
 # Map filesystem quant directory names to the publishable labels
 # used in each subplot's axes. The RANDOM router baseline is shown
-# as "UniformRand" to mirror the dataset convention in
-# `cross_model_comparison.py::_DATASET_PUBLISH_LABELS`.
+# as "UnifRand" to mirror the dataset convention in
+# `cross_model_comparison.py::BENCHMARK_ORDER`.
 _QUANT_PUBLISH_OVERRIDES: dict[str, str] = {
     "RANDOM": "UnifRand",
 }

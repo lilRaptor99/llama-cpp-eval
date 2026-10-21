@@ -466,6 +466,82 @@ def _layer_averaged_js_divergence_matrix(
     return out
 
 
+def _layer_averaged_pairwise_jaccard_with_std(
+        counts_list: list[np.ndarray], K: int, L: int
+        ) -> tuple[np.ndarray, np.ndarray]:
+    """Like `_layer_averaged_pairwise_jaccard`, but also returns the
+    per-cell standard deviation across the L layers.
+
+    Returns `(mean, std)`, both `(N, N)`. `mean[i, j]` is computed by
+    the SAME `np.mean` over the same layer-ordered list as
+    `_layer_averaged_pairwise_jaccard`, so the two functions agree
+    bit-for-bit — the tables therefore transcribe the figure's heatmap
+    rather than approximating it. `std[i, j]` is the population
+    standard deviation (ddof=0) of the same per-layer Jaccard values,
+    i.e. how much that cell's top-K agreement varies with depth.
+
+    Used by `cross_dataset_table.py` / `cross_quant_matrix_table.py`
+    for the `layer_std` column of the paper tables. The figure scripts
+    still call the std-free variant, so their output is unchanged.
+    """
+    N = len(counts_list)
+    if N == 0:
+        z = np.zeros((0, 0), dtype=np.float64)
+        return z, z.copy()
+    mean = np.zeros((N, N), dtype=np.float64)
+    std = np.zeros((N, N), dtype=np.float64)
+    for i in range(N):
+        mean[i, i] = 1.0
+        std[i, i] = 0.0
+    # Pre-compute per-(unit, layer) top-K sets — identical to the
+    # std-free variant so the two agree exactly.
+    sets: list[list[set[int]]] = [
+        [_top_k_set_for_layer(c, l, K) for l in range(L)] for c in counts_list
+    ]
+    for i in range(N):
+        for j in range(i + 1, N):
+            vals = [_jaccard(sets[i][l], sets[j][l]) for l in range(L)]
+            v = float(np.mean(vals))
+            mean[i, j] = mean[j, i] = v
+            std[i, j] = std[j, i] = float(np.std(vals))
+    return mean, std
+
+
+def _layer_averaged_js_divergence_matrix_with_std(
+        counts_list: list[np.ndarray]
+        ) -> tuple[np.ndarray, np.ndarray]:
+    """Like `_layer_averaged_js_divergence_matrix`, but also returns the
+    per-cell standard deviation across the layers.
+
+    Returns `(mean, std)`, both `(N, N)`. `mean[i, j]` matches the
+    std-free variant bit-for-bit (same `np.mean` over the same
+    layer-ordered list). `std[i, j]` is the population standard
+    deviation (ddof=0) of the same per-layer JSD values.
+
+    The diagonal is exactly 0.0 with std 0.0 — the two distributions
+    compared are the same object, so `log2(p/m) == 0` at every layer.
+    """
+    n_items = len(counts_list)
+    if n_items == 0:
+        z = np.zeros((0, 0), dtype=np.float64)
+        return z, z.copy()
+    n_layers = int(counts_list[0].shape[0])
+    mean = np.zeros((n_items, n_items), dtype=np.float64)
+    std = np.zeros((n_items, n_items), dtype=np.float64)
+    for i in range(n_items):
+        for j in range(i, n_items):
+            vals = [
+                _jensen_shannon_divergence(counts_list[i][layer],
+                                           counts_list[j][layer])
+                for layer in range(n_layers)
+            ]
+            m = float(np.mean(vals)) if vals else 0.0
+            s = float(np.std(vals)) if vals else 0.0
+            mean[i, j] = mean[j, i] = m
+            std[i, j] = std[j, i] = s
+    return mean, std
+
+
 def _millions_formatter(x: float, pos: int) -> str:
     """Tick formatter for routing-strip colorbar: 12.3M / 456.7K / 42.
 

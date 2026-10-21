@@ -503,12 +503,95 @@ The CLI:
 | `--width-in`    | Figure width in inches.                                       | `11.0` (double-column paper)                           |
 | `--height-in`   | Figure height in inches.                                      | `5.5` (2 rows × N model columns + colorbars)           |
 | `--dpi`         | Output DPI.                                                   | `300`                                                  |
-| `--jsd-vmax`    | JSD colorbar vmax (default: auto from all models' matrices).  | auto                                                   |
 
 The figure script (`cross_model_comparison.py`) and this one share
 the same `DEFAULT_MODELS` list — both are kept in sync by convention
 (make the same edit in both files if you want to change the model
 set).
+
+## Numeric tables for the comparison figures
+
+A heatmap cannot be the only record of its numbers in a printed
+paper. Two CLIs tabulate exactly the same matrices the two comparison
+figures draw, one per figure:
+
+| Script                      | Backs                                    | Default output dir                                        |
+| --------------------------- | ---------------------------------------- | --------------------------------------------------------- |
+| `cross_dataset_table.py`    | `cross_model_grid__<quant>.png`          | `<results-dir>/paper_heatmaps/cross_model_tables/<quant>/` |
+| `cross_quant_matrix_table.py` | `cross_quantization_grid.png`          | `<results-dir>/paper_heatmaps/cross_quant_tables/`         |
+
+Each writes exactly two files:
+
+| File                | Contents                                                                                                              |
+| ------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `*_pairwise.csv`    | long form, **one row per matrix cell**, full `float64` precision via `repr()` (shortest round-trippable form). Diagonal and lower triangle included, so the file is a complete record rather than a display view. |
+| `*_pairwise.md`     | **upper triangular**, one table per `(model, metric)`, each cell `value ± layer_std`, plus a condensed summary table. Renderable in GitHub / PRs. |
+
+CSV schema (identical in both):
+
+```text
+model,model_safe,quant_ref,unit_kind,unit_i,unit_j,metric,value,layer_std,n_layers,n_expert,k_model
+```
+
+`quant_ref` is empty for the cross-quant view, where the unit axis
+*is* the quantisation axis. `unit_kind` is `dataset` or `quant`.
+
+### `layer_std`
+
+`layer_std` is the population standard deviation (ddof=0) of the same
+per-layer quantity the cell mean averages — i.e. how much that cell's
+agreement varies with depth. It comes from two new helpers in
+`paper_heatmaps.py`, `_layer_averaged_pairwise_jaccard_with_std` and
+`_layer_averaged_js_divergence_matrix_with_std`. The mean they return
+is computed by the same `np.mean` over the same layer-ordered list as
+the existing std-free functions, so the tables transcribe the figure
+rather than approximating it.
+
+### Scientific notation
+
+Markdown cells switch from fixed decimals to scientific notation
+(`1.2e-03 ± 6.7e-04`) when the block's largest off-diagonal magnitude
+**among the real units** falls below `1e-2`. Two details make this
+work:
+
+- The threshold ignores the `UnifRand` baseline row. Real-routing vs.
+  random-router values are ~3 orders of magnitude larger than
+  unit-vs-unit ones, so including it would force the whole block into
+  fixed decimals and collapse every meaningful cell to `0.000`. This
+  is why cross-quant JS blocks read as `1.2e-03` while their baseline
+  row reads `9.1e-02` — the baseline is still printed, just not in the
+  notation decision.
+- The decision is per `(block, metric)`, so a Jaccard block and its JS
+  sibling can differ.
+
+The CSV is never affected — it always carries full precision.
+
+### Self-check
+
+```sh
+python examples/eval-heatmaps/cross_dataset_table.py --self-check
+python examples/eval-heatmaps/cross_quant_matrix_table.py --self-check
+```
+
+Recomputes the std-free matrices the figure scripts actually draw and
+asserts the tables agree to `1e-12`, plus symmetry, non-negative std,
+and the `1.0` / `0.0` diagonal invariants. Exits non-zero listing
+every failure. Run it in CI after touching either figure script.
+
+### Relationship to `cross_quantization_table.py`
+
+`cross_quant_matrix_table.py` and `cross_quantization_table.py` answer
+different questions and both stay:
+
+| Script                        | Question                                                                                  |
+| ----------------------------- | ----------------------------------------------------------------------------------------- |
+| `cross_quant_matrix_table.py` | What are the pairwise values in the cross-quant heatmap, verbatim?                          |
+| `cross_quantization_table.py` | How stable is the cross-dataset similarity ACROSS quantisations (mean ± std per dataset)?    |
+
+The table CLIs **import their loaders from the figure scripts**
+(`cross_model_comparison`, `cross_quantization_comparison`) rather
+than re-implementing them, so adding a dataset alias or changing the
+random-router fallback path in one place updates the tables too.
 
 ## Customizing labels
 

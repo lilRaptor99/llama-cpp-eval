@@ -79,17 +79,23 @@ from paper_heatmaps import (  # noqa: E402
 # user wants to change the set.
 DEFAULT_MODELS: list[tuple[str, str]] = [
     # (filesystem-safe model id, short name for the table).
-    ("allenai--OLMoE-1B-7B-0125-Instruct-GGUF",       "OLMoE-1B-7B"),
+    ("mradermacher--OLMoE-1B-7B-0924-Instruct-GGUF",       "OLMoE-1B-7B"),
     ("LiteLLMs--Mixtral-8x22B-Instruct-v0.1-GGUF",   "Mixtral-8x22B"),
     ("mradermacher--deepseek-moe-16b-chat-GGUF",      "DeepSeek-MoE-16B"),
     ("unsloth--Qwen3-30B-A3B-GGUF",                   "Qwen3-30B-A3B"),
+    # ("allenai--OLMoE-1B-7B-0924-Instruct",       "OLMoE-1B-7B"),
+    # ("mistralai--Mixtral-8x22B-Instruct-v0.1",   "Mixtral-8x22B"),
+    # ("deepseek-ai--deepseek-moe-16b-chat",      "DeepSeek-MoE-16B"),
+    # ("Qwen--Qwen3-30B-A3B",                   "Qwen3-30B-A3B"),
 ]
 
-# Dataset order — UniformRand last so the random-router baseline
+# Dataset order — UnifRand last so the random-router baseline
 # always appears at the right edge of the table (matching the figure's
-# BENCHMARK_ORDER convention from cross_model_comparison.py).
+# BENCHMARK_ORDER convention from cross_model_comparison.py, which
+# uses the same short label so the figure and this table line up
+# column-for-column).
 BENCHMARK_ORDER: list[str] = ["BBH", "HumanEval", "INCLUDE", "MMLU",
-                                "PopQA", "UniformRand"]
+                                "PopQA", "UnifRand"]
 
 
 # ----------------------------------------------------------------- caption
@@ -111,7 +117,7 @@ TABLE_CAPTION: str = (
     "OTHER datasets in this quant. Rows are organised as (model, "
     "metric) pairs; columns are dataset labels. `n_quants` reports "
     "the number of quantisations that contributed (the `RANDOM` "
-    "quant is skipped because its label set lacks the `UniformRand` "
+    "quant is skipped because its label set lacks the `UnifRand` "
     "row). Low `std` indicates that the cross-dataset routing "
     "similarity for this dataset is stable across quantisations; "
     "high `std` indicates that quantisation meaningfully affects the "
@@ -171,7 +177,7 @@ def _load_cell_counts(model_dir: Path, quant: str
     #
     #   1. Per-benchmark, inside each `moe-<ds>/random/` subdirectory.
     #      We sum the marginal counts across all of these to build a
-    #      synthetic top-level "UniformRand" dataset.
+    #      synthetic top-level "UnifRand" dataset.
     #
     #   2. Already pre-aggregated, as a top-level
     #      `<cell>/random/expert_counts.json`. Some users run the
@@ -196,7 +202,7 @@ def _load_cell_counts(model_dir: Path, quant: str
                     and r_k == arch["n_expert_used"]):
                 m = np.asarray(r_marg, dtype=np.int64)
                 if m.shape == (r_L, r_E):
-                    counts["UniformRand"] = m
+                    counts["UnifRand"] = m
                     random_loaded = True
 
     if not random_loaded:
@@ -210,8 +216,8 @@ def _load_cell_counts(model_dir: Path, quant: str
                     and r_arch["n_expert_used"] == arch["n_expert_used"]):
                 # The aggregator returns {"Random": agg} with the
                 # mixed-case key — remap to our publishable label
-                # "UniformRand".
-                counts.setdefault("UniformRand",
+                # "UnifRand".
+                counts.setdefault("UnifRand",
                                    rand_counts["Random"])
 
     if arch is None:
@@ -348,13 +354,13 @@ def _print_wide_table(rows: list[dict[str, Any]]) -> None:
 
     Layout (rows = (model, metric), columns = datasets, cells =
     "mean ± std"):
-                                BBH        HumanEval   INCLUDE     MMLU       PopQA     UniformRand
+                                BBH        HumanEval   INCLUDE     MMLU       PopQA     UnifRand
         OLMoE-1B-7B   Jaccard    0.30±0.05  0.20±0.03   ...
                       JSD        ...
         Mixtral-8x22B Jaccard    ...
         ...
 
-    Datasets are sorted with `UniformRand` last (matching the
+    Datasets are sorted with `UnifRand` last (matching the
     BENCHMARK_ORDER ordering) so the baseline always appears at the
     right edge of the table.
     """

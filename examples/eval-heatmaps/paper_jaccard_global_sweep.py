@@ -47,7 +47,7 @@ Mathematical contract (identical to `jaccard_sweep_from_cpp.py`):
   non-empty — matches the convention in `paper_heatmaps._jaccard`.
 
 Only the 5 real benchmarks (BBH / HumanEval / INCLUDE / MMLU / PopQA)
-are compared; the optional `UniformRand` baseline loaded by
+are compared; the optional `UnifRand` baseline loaded by
 `cross_model_comparison._load_cell_counts` is filtered out so the
 figure answers the same question as the existing
 `jaccard_global.png` (which only sees `moe-*` directories).

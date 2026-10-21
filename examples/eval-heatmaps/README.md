@@ -284,8 +284,102 @@ Only the 5 real benchmarks (BBH / HumanEval / INCLUDE / MMLU /
 PopQA) are compared — the script loads `moe-*/expert_counts.json`
 exactly the way `jaccard_sweep_from_cpp.py` does, so the curves
 are bit-identical to the existing 120 DPI overview (modulo
-per-layer averaging). The optional `UniformRand` baseline is
+per-layer averaging). The optional `UnifRand` baseline is
 filtered out.
+
+## Paper-quality cross-quantization Jaccard K-sweep
+
+`paper_jaccard_quant_sweep.py` is the cross-**quantization** twin of
+`paper_jaccard_global_sweep.py` (which is cross-**dataset**). For
+each model it sweeps K over that model's quantizations and plots the
+**mean pairwise Jaccard**, so a reviewer can see how much top-K
+routing overlap survives when the same model is run at different
+precisions — and how that overlap grows as K relaxes away from the
+model's own `K_model`.
+
+Layout is **1 row × N columns, one column per model**:
+
+```
+        [ OLMoE-1B-7B  ][ Mixtral-8x22B ][ DeepSeek-MoE-16B ][ Qwen3-30B-A3B ]
+         L=16 E=64 K=8 | L=56 E=8  K=2  | L=28 E=64  K=6   | L=48 E=128 K=8
+J                   |                |                |                |
+a                   |  thin per-layer traces + bold mean line        |
+c                   |  dotted K = K_model marker, labeled K=8, K=2, … |
+c                   |                                                |
+i                   +------------------------------------------------+
+d                K              K               K               K
+                          legend:  trace / mean / K = K_model
+```
+
+Each panel draws thin per-layer traces (α=0.18), a bold
+layer-averaged mean line, the `y = 1.0` perfect-agreement reference,
+and a dotted vertical marker at `K = K_model` **labeled in-axes**
+with that model's value (`K=8`, `K=2`, …). The left gutter carries
+the rotated row label `Jaccard Similarity`, matching the
+cross-quantization heatmap's `_draw_one_heatmap(row_label=...)`
+styling so the two figures share a visual vocabulary. Each column
+carries its own `K` x-axis label — the K grids differ by 16× across
+models (Mixtral tops out at `K=6`, Qwen3 at `K=64`), so the axis
+belongs to the panel rather than to the figure — and a shared
+3-column legend (`Per-Layer Mean` / `Layer-Averaged Mean` /
+`K = K_model`) sits beneath them.
+
+Font sizes are matched to `cross_quantization_comparison.py` so this
+figure and the cross-quantization heatmap read as one system when
+placed side by side: `8` for tick text (the heatmap's
+`tick_label_fontsize`), `9` for the column titles and the legend
+(its `set_title`), and `10` for the gutter and axis labels (its
+`row_label_fontsize`). The legend is a step up from the tick text
+because it is the figure's only prose — it carries more meaning per
+character than an axis number and is read from further away. Tick
+density is capped per panel with `MaxNLocator(nbins=6, integer=True)`
+so the wide-K models don't crowd and the narrow-K ones don't go
+blank.
+
+Only the **mean pairwise Jaccard** is plotted. The generalized
+`|∩|/|∪|` curve is deliberately omitted here: with six quants per
+model it collapses toward 0 the moment any single quant diverges,
+so the curve is almost always pinned to the floor and carries no
+readable signal — the pairwise mean conveys the same ordering
+without it.
+
+```sh
+python examples/eval-heatmaps/paper_jaccard_quant_sweep.py
+
+# Verify the bold line at K_model matches the cross-quant heatmap:
+python examples/eval-heatmaps/paper_jaccard_quant_sweep.py --self-check
+```
+
+Output (under `<output-dir>/`, default
+`<results-dir>/paper_heatmaps/cross_quant_sweep/`):
+
+- `cross_quant_jaccard_sweep.png` — the 1 × N paper figure
+
+The CLI:
+
+| Flag            | Meaning                                                             | Default                                                       |
+| --------------- | ------------------------------------------------------------------- | ------------------------------------------------------------- |
+| `--results-dir` | Root results directory.                                             | `/mnt/data/results-llama-cpp`                                 |
+| `--models`      | Restrict to a subset of model ids (repeatable).                     | the 4 models from `cross_quantization_comparison.DEFAULT_MODELS` |
+| `--quants`      | Restrict to a subset of quant dirs (repeatable).                    | all valid quants (incl. the `UnifRand` baseline)               |
+| `--output-dir`  | Output directory.                                                   | `<results-dir>/paper_heatmaps/cross_quant_sweep`               |
+| `--width-in`    | Figure width in inches.                                             | `11.0`                                                        |
+| `--height-in`   | Figure height in inches.                                            | `3.5`                                                         |
+| `--dpi`         | Output DPI.                                                         | `300`                                                         |
+| `--k-min`       | Minimum K in the sweep.                                             | `1`                                                           |
+| `--k-max-frac`  | `K_max = ceil(n_expert * k_max_frac)`.                              | `0.50`                                                        |
+| `--num-ks`      | Number of K values in the linear sweep.                             | `21`                                                          |
+| `--self-check`  | Assert the bold line at `K_model` equals the heatmap's off-diagonal mean. Implies `--force`. | off                        |
+| `--force`       | Re-render even if the output PNG already exists.                    | off                                                           |
+
+The script imports its quant discovery and heatmap matrices
+directly from `cross_quantization_comparison.py` rather than
+duplicating the loader, so it always sweeps exactly the quant set
+the heatmap plots. `--self-check` re-derives the heatmap's Jaccard
+matrix through the heatmap's own loader and asserts the bold line's
+value at `K = K_model` equals that matrix's off-diagonal mean
+(tolerance `1e-12`); it exits non-zero if the two views would
+disagree, so the figure can never silently contradict the heatmap.
 
 ## Cross-model comparison figure (for the paper)
 
@@ -333,15 +427,15 @@ The figure uses:
   directly comparable on the same colorbar scale (the user explicitly
   asked for this — "so the JSD max is similar to the other individual
   JSD heatmaps").
-- **`UniformRand` (uniform random router) baseline is included** as a
+- **`UnifRand` (uniform random router) baseline is included** as a
   6th dataset row/column when per-benchmark `random/` JSONs (or a
   pre-aggregated `<cell>/random/expert_counts.json`) are present —
-  same convention as `paper_heatmaps.py`. The label is "UniformRand"
+  same convention as `paper_heatmaps.py`. The label is "UnifRand"
   (not just "Random") because the latter could be read by a casual
-  reviewer as "arbitrary baseline"; "UniformRand" makes the routing
-  scheme explicit. The UniformRand row appears at the END of each
-  matrix so the comparison reads naturally: real benchmarks first,
-  baseline at the bottom.
+  reviewer as "arbitrary baseline"; "UnifRand" makes the routing
+  scheme explicit while staying short enough to fit as an axis tick.
+  The UnifRand row appears at the END of each matrix so the
+  comparison reads naturally: real benchmarks first, baseline last.
 - **Short model names** (`OLMoE-1B`, `Mixtral-8x22B`, etc.) as column
   titles, suitable for a paper caption.
 - **Dataset labels (BBH / HumanEval / INCLUDE / MMLU / PopQA /
@@ -389,7 +483,7 @@ the numbers):
 > quant. Rows are organised as (model, metric) pairs; columns are
 > dataset labels. `n_quants` reports the number of quantisations that
 > contributed (the `RANDOM` quant is skipped because its label set
-> lacks the `UniformRand` row). Low `std` indicates that the
+> lacks the `UnifRand` row). Low `std` indicates that the
 > cross-dataset routing similarity for this dataset is stable across
 > quantisations; high `std` indicates that quantisation meaningfully
 > affects the routing distribution.
@@ -455,7 +549,7 @@ Layout:
 
 `N_q` is the number of valid quantisations discovered per model
 (typically 2–4: `Q2_K`, `Q4_K_M`, optionally `Q8_0` / `F16` / `F32`,
-plus the `UniformRand` baseline when `<model>/RANDOM/overall/...`
+plus the `UnifRand` baseline when `<model>/RANDOM/overall/...`
 exists). Models with different `N_q` still appear in the same figure
 — cell sizes vary modestly across models (small `N_q` → bigger
 cells, large `N_q` → smaller cells), which is fine for a
@@ -466,7 +560,7 @@ cross-model comparison.
 - **Short model names** as column titles (`OLMoE-1B-7B`,
   `Mixtral-8x22B`, `DeepSeek-MoE-16B`, `Qwen3-30B-A3B`) — same
   short names as `cross_model_comparison.py`.
-- **`UniformRand` (uniform random router) baseline** is included as
+- **`UnifRand` (uniform random router) baseline** is included as
   one of the `N_q` quants when its `RANDOM/` directory is present.
 - **Quant labels sorted by `QUANT_PRIORITY`** (most-precise first:
   `F32`, `F16`, `BF16`, `FP8`, then descending by aggressiveness

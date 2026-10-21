@@ -127,7 +127,7 @@ DEFAULT_MODELS: list[tuple[str, str]] = [
 # short form is less ambiguous than "Random" which could be read as
 # "arbitrary baseline" by a casual reader).
 BENCHMARK_ORDER: list[str] = ["BBH", "HumanEval", "INCLUDE", "MMLU",
-                                "PopQA", "UniformRand"]
+                                "PopQA", "UnifRand"]
 
 # Figure sizing (double-column paper).
 FIGURE_WIDTH_IN: float = 11.0
@@ -239,7 +239,7 @@ def _load_cell_counts(model_dir: Path, quant: str
                     and r_k == arch["n_expert_used"]):
                 m = np.asarray(r_marg, dtype=np.int64)
                 if m.shape == (r_L, r_E):
-                    counts["UniformRand"] = m
+                    counts["UnifRand"] = m
                     random_loaded = True
                 else:
                     key = f"random-shape:{pre_agg_path}"
@@ -267,7 +267,7 @@ def _load_cell_counts(model_dir: Path, quant: str
                     # BENCHMARK_ORDER entry above. `setdefault` so
                     # we don't clobber a real "Random" / "UniformRand"
                     # cell entry if the user has one at the cell root.
-                    counts.setdefault("UniformRand", c)
+                    counts.setdefault("UnifRand", c)
 
     if arch is None:
         raise SystemExit(f"[error] {cell_dir}: no usable datasets found")
@@ -288,14 +288,26 @@ def _order_labels(counts: dict[str, np.ndarray]
 def _draw_one_heatmap(ax, mat, labels, *, vmin, vmax, cmap,
                       cell_text_format: str = "{v:.2f}",
                       cell_text_threshold: float = 0.5,
-                      tick_label_fontsize: int = 7,
+                      tick_label_fontsize: int = 8,
                       cell_text_fontsize: int = 6,
                       cell_text_color_above: str = "white",
                       cell_text_color_below: str = "black",
+                      row_label: str | None = None,
+                      row_label_fontsize: int = 10,
                       ) -> "matplotlib.image.AxesImage":
     """Render one heatmap into `ax` (no titles / no axis labels) and
     return the `AxesImage` so the caller can build a shared colorbar.
+
+    If `row_label` is supplied, it is rendered as the subplot's
+    y-axis label (vertical text in the gutter immediately to the
+    left of the heatmap). The label takes zero horizontal space
+    inside the heatmap, so it can identify each row without
+    shrinking the cell area — readers instantly know which row is
+    Jaccard Similarity vs. JS-divergence without consulting the caption.
     """
+    if row_label is not None:
+        ax.set_ylabel(row_label, fontsize=row_label_fontsize,
+                       rotation=90, labelpad=8, va="center")
     N = len(labels)
     im = ax.imshow(mat, vmin=vmin, vmax=vmax, cmap=cmap, aspect="equal",
                    interpolation="nearest")
@@ -489,8 +501,9 @@ def main() -> int:
             cell_text_threshold=0.5,
             cell_text_color_above="white",
             cell_text_color_below="black",
-            tick_label_fontsize=7,
+            tick_label_fontsize=8,
             cell_text_fontsize=6,
+            row_label=("Jaccard Similarity" if col == 0 else None),
         )
         # Title combines the model name and the `--quant` value with a
         # pipe separator (e.g. "OLMoE-1B-7B | Q4_K_M"). This makes
@@ -500,14 +513,28 @@ def main() -> int:
         # already in the PNG file name, but duplicating it in the
         # title is friendlier when the PNG is embedded in a slide.
         ax.set_title(f"{short_name} | {args.quant}", fontsize=9, pad=4)
-        # Hide x-tick labels (these are the dataset names, repeated on
-        # all 4 subplots — save horizontal space; user requested row
-        # titles in caption).
+        # Tick labels. x-tick labels are repeated on all subplots so
+        # we only render them on the BOTTOM row (the JSD row below
+        # this one) — readers scan the column names once at the
+        # bottom of the figure rather than seeing them under every
+        # subplot. y-tick labels are only shown on the LEFTMOST
+        # column of each row — the row label in the gutter ("Jaccard
+        # Similarity" / "JS divergence") handles row identification,
+        # and the dataset names on the y-axis are shown just once per
+        # row.
         plt.setp(ax.get_xticklabels(), visible=False)
-        if col > 0:
-            # Hide y-tick labels on inner subplots too — the leftmost
-            # column's labels serve the whole row.
+        if col == 0:
+            # Leftmost column gets y-tick labels (dataset names) AND
+            # the gutter row label — they live in different visual
+            # gutters (left margin vs. just-left-of-axis), so they
+            # coexist cleanly. Reset tick length too in case the
+            # earlier `length=0` had it zeroed out.
+            ax.tick_params(axis="y", which="both", length=0)
+        else:
+            # Inner columns: no y-tick labels (the leftmost column
+            # serves the whole row).
             plt.setp(ax.get_yticklabels(), visible=False)
+            ax.tick_params(axis="y", which="both", length=0)
         jaccard_axes.append(ax)
         jaccard_im = im
 
@@ -515,7 +542,7 @@ def main() -> int:
     cax_jacc = fig.add_subplot(gs[0, n_cols])
     cb_jacc = fig.colorbar(jaccard_im, cax=cax_jacc,
                             fraction=1.0, pad=0.0)
-    cb_jacc.ax.tick_params(labelsize=7, length=0)
+    cb_jacc.ax.tick_params(labelsize=8, length=0)
     cb_jacc.outline.set_visible(False)
     cb_jacc.ax.yaxis.set_major_formatter(FuncFormatter(_format_v2))
     cb_jacc.set_ticks(np.linspace(0.0, 1.0, 6))
@@ -544,19 +571,27 @@ def main() -> int:
             cell_text_threshold=0.5,
             cell_text_color_above="black",
             cell_text_color_below="white",
-            tick_label_fontsize=7,
+            tick_label_fontsize=8,
             cell_text_fontsize=6,
+            row_label=("JS divergence" if col == 0 else None),
         )
-        # Hide y-tick labels on inner subplots.
-        if col > 0:
+        # Tick labels for the JSD row. The dataset names are now
+        # shown on the BOTTOM row's x-axis (one set of column labels
+        # serves the whole figure) and on the leftmost column's
+        # y-axis (one set of row labels per metric). The gutter
+        # label is preserved on the leftmost column.
+        if col == 0:
+            ax.tick_params(axis="y", which="both", length=0)
+        else:
             plt.setp(ax.get_yticklabels(), visible=False)
+            ax.tick_params(axis="y", which="both", length=0)
         jsd_axes.append(ax)
         jsd_im = im
 
     # Per-row colorbar for JSD (right of the row).
     cax_jsd = fig.add_subplot(gs[1, n_cols])
     cb_jsd = fig.colorbar(jsd_im, cax=cax_jsd, fraction=1.0, pad=0.0)
-    cb_jsd.ax.tick_params(labelsize=7, length=0)
+    cb_jsd.ax.tick_params(labelsize=8, length=0)
     cb_jsd.outline.set_visible(False)
     cb_jsd.ax.yaxis.set_major_formatter(FuncFormatter(_format_v3))
     cb_jsd.set_ticks(np.linspace(0.0, 0.5, 6))

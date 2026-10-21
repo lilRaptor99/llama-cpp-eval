@@ -137,7 +137,7 @@ QUANT_PRIORITY: list[str] = [
 # as "UniformRand" to mirror the dataset convention in
 # `cross_model_comparison.py::_DATASET_PUBLISH_LABELS`.
 _QUANT_PUBLISH_OVERRIDES: dict[str, str] = {
-    "RANDOM": "UniformRand",
+    "RANDOM": "UnifRand",
 }
 
 # Figure sizing (double-column paper). Same as
@@ -281,14 +281,27 @@ def _compute_model_cross_quant_matrices(model_dir: Path,
 def _draw_one_heatmap(ax, mat, labels, *, vmin, vmax, cmap,
                       cell_text_format: str = "{v:.2f}",
                       cell_text_threshold: float = 0.5,
-                      tick_label_fontsize: int = 7,
+                      tick_label_fontsize: int = 8,
                       cell_text_fontsize: int = 6,
                       cell_text_color_above: str = "white",
                       cell_text_color_below: str = "black",
+                      row_label: str | None = None,
+                      row_label_fontsize: int = 10,
                       ) -> "matplotlib.image.AxesImage":
     """Render one heatmap into `ax` (no titles / no axis labels) and
     return the `AxesImage` so the caller can build a shared colorbar.
+
+    If `row_label` is supplied, it is rendered as the subplot's
+    y-axis label (vertical text in the gutter immediately to the
+    left of the heatmap). The label takes zero horizontal space
+    inside the heatmap, so it can identify each row without
+    shrinking the cell area — readers instantly know which row is
+    Jaccard Similarity vs. JS-divergence without consulting the caption.
     """
+    if row_label is not None:
+        ax.set_ylabel(row_label, fontsize=row_label_fontsize,
+                       rotation=90, labelpad=8, va="center")
+
     N = len(labels)
     im = ax.imshow(mat, vmin=vmin, vmax=vmax, cmap=cmap, aspect="equal",
                    interpolation="nearest")
@@ -456,14 +469,32 @@ def main() -> int:
             cell_text_threshold=0.5,
             cell_text_color_above="white",
             cell_text_color_below="black",
-            tick_label_fontsize=7,
+            tick_label_fontsize=8,
             cell_text_fontsize=6,
+            # Row labels: only the leftmost column shows them so the
+            # inner columns can keep their y-tick labels hidden without
+            # the gutter text colliding with the cells.
+            row_label=("Jaccard Similarity" if col == 0 else None),
         )
         ax.set_title(short_name, fontsize=9, pad=4)
-        # Hide x-tick labels — repeated on every subplot, save space.
+        # Tick labels. x-tick labels (the quant names) are only
+        # rendered on the BOTTOM row so readers scan the column
+        # names once rather than seeing them under every subplot.
+        # y-tick labels are only rendered on the LEFTMOST column of
+        # each row — the row label in the gutter ("Jaccard
+        # Similarity" / "JS divergence") handles row identification,
+        # and the quant names on the y-axis are shown just once per
+        # row.
         plt.setp(ax.get_xticklabels(), visible=False)
-        if col > 0:
+        if col == 0:
+            # Leftmost column: shows y-tick labels (quant names)
+            # AND the gutter row label. They live in different
+            # gutters (left margin vs. just-left-of-axis), so they
+            # coexist cleanly.
+            ax.tick_params(axis="y", which="both", length=0)
+        else:
             plt.setp(ax.get_yticklabels(), visible=False)
+            ax.tick_params(axis="y", which="both", length=0)
         jaccard_axes.append(ax)
         jaccard_im = im
 
@@ -471,7 +502,7 @@ def main() -> int:
     cax_jacc = fig.add_subplot(gs[0, n_cols])
     cb_jacc = fig.colorbar(jaccard_im, cax=cax_jacc,
                             fraction=1.0, pad=0.0)
-    cb_jacc.ax.tick_params(labelsize=7, length=0)
+    cb_jacc.ax.tick_params(labelsize=8, length=0)
     cb_jacc.outline.set_visible(False)
     cb_jacc.ax.yaxis.set_major_formatter(FuncFormatter(_format_v2))
     cb_jacc.set_ticks(np.linspace(0.0, 1.0, 6))
@@ -489,18 +520,27 @@ def main() -> int:
             cell_text_threshold=0.5,
             cell_text_color_above="black",
             cell_text_color_below="white",
-            tick_label_fontsize=7,
+            tick_label_fontsize=8,
             cell_text_fontsize=6,
+            row_label=("JS divergence" if col == 0 else None),
         )
-        if col > 0:
+        # The JSD row shows the x-tick labels (quant names) — they
+        # are the COLUMN identification for the whole figure. The
+        # y-tick labels are only on the leftmost column of this
+        # row; the gutter label (rendered by `_draw_one_heatmap`)
+        # identifies the row metric.
+        if col == 0:
+            ax.tick_params(axis="y", which="both", length=0)
+        else:
             plt.setp(ax.get_yticklabels(), visible=False)
+            ax.tick_params(axis="y", which="both", length=0)
         jsd_axes.append(ax)
         jsd_im = im
 
     # Per-row colorbar for JSD (right of the row).
     cax_jsd = fig.add_subplot(gs[1, n_cols])
     cb_jsd = fig.colorbar(jsd_im, cax=cax_jsd, fraction=1.0, pad=0.0)
-    cb_jsd.ax.tick_params(labelsize=7, length=0)
+    cb_jsd.ax.tick_params(labelsize=8, length=0)
     cb_jsd.outline.set_visible(False)
     cb_jsd.ax.yaxis.set_major_formatter(FuncFormatter(_format_v3))
     cb_jsd.set_ticks(np.linspace(0.0, jsd_vmax, 6))

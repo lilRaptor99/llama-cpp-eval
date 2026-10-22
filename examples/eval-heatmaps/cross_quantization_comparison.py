@@ -76,7 +76,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -158,6 +158,44 @@ def _format_v2(x: float, _pos: int) -> str:
 def _format_v3(x: float, _pos: int) -> str:
     """3-decimal tick formatter (e.g., 0.108) for the JSD colorbar."""
     return f"{x:.3f}"
+
+
+def _format_cell_sci(v: float, decimals: int) -> str:
+    """Fixed-point above the rounding threshold, scientific below it.
+
+    JSD is a divergence, so it collapses toward 0 as quantizations
+    agree — and on the cross-quantization view it collapses HARD:
+    40-67% of off-diagonal cells fall below 5e-4 (median ~1e-3, min
+    ~1e-6). A plain `{v:.3f}` renders every one of those as the
+    identical, and completely uninformative, string `0.000`.
+
+    So: render in scientific notation exactly when the fixed-point
+    form would round to zero, i.e. below half a unit in the last
+    place. The switch is value-driven rather than
+    `decimals`-driven, so a row reading
+
+        0.000   1.2e-04   0.001   0.091
+
+    carries strictly more information than a row of `0.000`s, and the
+    decimal places that remain readable stay readable. Exact zero is
+    kept as `0.000` rather than `0.0e+00` — it is a meaningful
+    diagonal/off-diagonal value, not a missing measurement.
+    """
+    if not np.isfinite(v):
+        return "nan"
+    if v != 0.0 and abs(v) < 0.5 * 10.0 ** (-decimals):
+        return f"{v:.1e}"
+    return f"{v:.{decimals}f}"
+
+
+def _fmt_cell_jaccard(v: float) -> str:
+    """Cell formatter for the Jaccard row (2 decimals)."""
+    return _format_cell_sci(v, 2)
+
+
+def _fmt_cell_jsd(v: float) -> str:
+    """Cell formatter for the JSD row (3 decimals + scientific fallback)."""
+    return _format_cell_sci(v, 3)
 
 
 # ------------------------------------------------------------------- helpers
@@ -279,7 +317,8 @@ def _compute_model_cross_quant_matrices(model_dir: Path,
 # ------------------------------------------------------------------- plot
 
 def _draw_one_heatmap(ax, mat, labels, *, vmin, vmax, cmap,
-                      cell_text_format: str = "{v:.2f}",
+                      cell_text_format: Callable[[float], str]
+                      = _fmt_cell_jaccard,
                       cell_text_threshold: float = 0.5,
                       tick_label_fontsize: int = 8,
                       cell_text_fontsize: int = 6,
@@ -329,7 +368,7 @@ def _draw_one_heatmap(ax, mat, labels, *, vmin, vmax, cmap,
             vnorm = (v - vmin) / max(1e-12, (vmax - vmin))
             color = (cell_text_color_above if vnorm > cell_text_threshold
                      else cell_text_color_below)
-            ax.text(j, i, cell_text_format.format(v=v), ha="center",
+            ax.text(j, i, cell_text_format(v), ha="center",
                     va="center", fontsize=cell_text_fontsize, color=color)
     return im
 
@@ -465,7 +504,7 @@ def main() -> int:
         im = _draw_one_heatmap(
             ax, data["jaccard"], data["labels"],
             vmin=0.0, vmax=1.0, cmap="Blues",
-            cell_text_format="{v:.2f}",
+            cell_text_format=_fmt_cell_jaccard,
             cell_text_threshold=0.5,
             cell_text_color_above="white",
             cell_text_color_below="black",
@@ -516,7 +555,7 @@ def main() -> int:
         im = _draw_one_heatmap(
             ax, data["jsd"], data["labels"],
             vmin=0.0, vmax=jsd_vmax, cmap="Blues_r",
-            cell_text_format="{v:.3f}",
+            cell_text_format=_fmt_cell_jsd,
             cell_text_threshold=0.5,
             cell_text_color_above="black",
             cell_text_color_below="white",

@@ -231,67 +231,10 @@ results tree is cheap. Pass `--force` to regenerate.
 If the cross-quant step fails with `[skip] <quant>/overall/counts_total_overview.json:
 not found`, you forgot step 2.
 
-## Paper-quality jaccard_global K-sweep (per cell)
-
-The 120 DPI `jaccard_sweep_from_cpp.py::jaccard_global.png` plots
-two metrics (generalized |∩|/|∪| + mean pairwise Jaccard) overlaid
-on a single plot with a multi-line title, grid, and legend. The
-paper-quality counterpart `paper_jaccard_global_sweep.py` (single
-script in this directory) re-renders the same view as a clean
-**2-row × 1-col figure** (300 DPI, no titles, no grid):
-
-```
-    [ generalized |∩|/|∪|    (strict consensus)        ]
-    [ mean pairwise Jaccard   (smoother average)        ]
-                  K  ->
-```
-
-Stacking the two metrics makes the relationship between strict
-consensus and pairwise agreement immediately visible (the strict
-curve is always ≤ the pairwise curve by definition, and the gap
-grows as the datasets diverge). The shared K axis removes
-redundant labeling. The `K_model` vertical marker and the `y = 1.0`
-reference line are kept so the reader can immediately locate the
-operating point and the perfect-agreement upper bound.
-
-Usage (one cell at a time — single-cell CLI matches the existing
-`jaccard_sweep_from_cpp.py` semantics):
-
-```sh
-python examples/eval-heatmaps/paper_jaccard_global_sweep.py \
-    --cell-dir /mnt/data/results-llama-cpp/allenai--OLMoE-1B-7B-0125-Instruct-GGUF/Q4_K_M
-```
-
-Output (under `<output-dir>/`, default `<cell-dir>/paper_jaccard_sweep/`):
-
-- `jaccard_global.png`     — the 2-row paper figure
-
-The CLI:
-
-| Flag            | Meaning                                                       | Default                                                |
-| --------------- | ------------------------------------------------------------- | ------------------------------------------------------ |
-| `--cell-dir`    | Single (model, quant) cell directory (required).              | (none)                                                 |
-| `--output-dir`  | Output directory.                                             | `<cell-dir>/paper_jaccard_sweep`                       |
-| `--width-in`    | Figure width in inches.                                       | `5.0` (single-column paper)                            |
-| `--height-in`   | Figure height in inches.                                      | `4.0` (2 stacked subplots + shared K axis)             |
-| `--dpi`         | Output DPI.                                                   | `300`                                                  |
-| `--k-min`       | Minimum K in the sweep.                                       | `1`                                                    |
-| `--k-max-frac`  | `K_max = ceil(n_expert * k_max_frac)`.                        | `0.50`                                                 |
-| `--num-ks`      | Number of K values in the linear sweep.                       | `21`                                                   |
-| `--force`       | Re-render even if the output PNG already exists.              | off                                                    |
-
-Only the 5 real benchmarks (BBH / HumanEval / INCLUDE / MMLU /
-PopQA) are compared — the script loads `moe-*/expert_counts.json`
-exactly the way `jaccard_sweep_from_cpp.py` does, so the curves
-are bit-identical to the existing 120 DPI overview (modulo
-per-layer averaging). The optional `UnifRand` baseline is
-filtered out.
-
 ## Paper-quality cross-quantization Jaccard K-sweep
 
-`paper_jaccard_quant_sweep.py` is the cross-**quantization** twin of
-`paper_jaccard_global_sweep.py` (which is cross-**dataset**). For
-each model it sweeps K over that model's quantizations and plots the
+`paper_jaccard_quant_sweep.py` sweeps K over each model's
+quantizations and plots the
 **mean pairwise Jaccard**, so a reviewer can see how much top-K
 routing overlap survives when the same model is run at different
 precisions — and how that overlap grows as K relaxes away from the
@@ -304,25 +247,67 @@ Layout is **1 row × N columns, one column per model**:
          L=16 E=64 K=8 | L=56 E=8  K=2  | L=28 E=64  K=6   | L=48 E=128 K=8
 J                   |                |                |                |
 a                   |  thin per-layer traces + bold mean line        |
+c                   |  dashed UnifRand-expected chance line            |
 c                   |  dotted K = K_model marker, labeled K=8, K=2, … |
 c                   |                                                |
 i                   +------------------------------------------------+
 d                K              K               K               K
-                          legend:  trace / mean / K = K_model
+              legend: trace / mean / UnifRand expected / K = K_model
 ```
 
 Each panel draws thin per-layer traces (α=0.18), a bold
 layer-averaged mean line, the `y = 1.0` perfect-agreement reference,
-and a dotted vertical marker at `K = K_model` **labeled in-axes**
+a dashed **UnifRand-expected** chance-level line, and a dotted
+vertical marker at `K = K_model` **labeled in-axes**
 with that model's value (`K=8`, `K=2`, …). The left gutter carries
 the rotated row label `Jaccard Similarity`, matching the
 cross-quantization heatmap's `_draw_one_heatmap(row_label=...)`
 styling so the two figures share a visual vocabulary. Each column
 carries its own `K` x-axis label — the K grids differ by 16× across
-models (Mixtral tops out at `K=6`, Qwen3 at `K=64`), so the axis
+models (Mixtral stops at `K=4`, Qwen3 at `K=64`), so the axis
 belongs to the panel rather than to the figure — and a shared
-3-column legend (`Per-Layer Mean` / `Layer-Averaged Mean` /
-`K = K_model`) sits beneath them.
+4-column legend (`Per-Layer Mean` / `Layer-Averaged Mean` /
+`UnifRand Expected` / `K = K_model`) sits beneath them.
+
+### The `UnifRand` baseline is a reference line, not a member of the average
+
+The random router is **excluded from the pairwise mean**. It is not
+a quantization: averaging it in lets one structureless router
+contribute `C(N_real, 2)` near-chance pairs — 5 of the 15 pairs for a
+five-quant model — which dilutes the quant-to-quant signal and mixes
+two different populations into a single number. The effect is not
+subtle. Excluding it moves the bold line at `K_model` from roughly
+0.63–0.68 to **0.86–0.94**, i.e. quant-to-quant agreement was being
+understated by about 30 percentage points.
+
+The baseline is therefore drawn instead as its own dashed line: the
+**exact expected Jaccard of two independent uniform K-subsets of an
+E-set**,
+
+```text
+P(j) = C(K, j) · C(E − K, K − j) / C(E, K),   max(0, 2K − E) ≤ j ≤ K
+E[J] = Σ_j P(j) · j / (2K − j)
+```
+
+This is *not* `K/E` — the familiar shortcut overestimates badly (at
+`K = E/2` it predicts 0.50 where the true expectation is 0.34), and
+even the ratio-of-expectations `K/(2E − K)` is not `E[ratio]`. The
+closed-form sum is cheap (`E ≤ 128`) and is what the figure draws.
+It tracks the measured `RANDOM` runs in the results tree to within
+~0.01 for OLMoE and Qwen3 across the non-degenerate K range.
+
+### The K axis is capped at `E/2`
+
+`--k-max-frac` defaults to `0.50` and is now a hard bound. The
+shared `_make_k_values` helper force-includes `min(3 · K_model, E)`
+so sibling overview plots line up on the same K axis; for every
+model in the default set that anchor lands at or below `E/2` except
+Mixtral (`E=8`, `K_model=2`), where it reaches `K=6` = 0.75·E. Past
+`E/2` the overlap is forced high by pigeonhole — a *uniform random*
+router already scores ~0.61 Jaccard at `K = 0.75E` — so the high-K
+tail measures set geometry rather than routing stability. `K_model`
+itself is always retained, even if it exceeds the cap, and the script
+warns when that happens.
 
 Font sizes are matched to `cross_quantization_comparison.py` so this
 figure and the cross-quantization heatmap read as one system when
@@ -337,7 +322,7 @@ so the wide-K models don't crowd and the narrow-K ones don't go
 blank.
 
 Only the **mean pairwise Jaccard** is plotted. The generalized
-`|∩|/|∪|` curve is deliberately omitted here: with six quants per
+`|∩|/|∪|` curve is deliberately omitted here: with several quants per
 model it collapses toward 0 the moment any single quant diverges,
 so the curve is almost always pinned to the floor and carries no
 readable signal — the pairwise mean conveys the same ordering
@@ -361,25 +346,29 @@ The CLI:
 | --------------- | ------------------------------------------------------------------- | ------------------------------------------------------------- |
 | `--results-dir` | Root results directory.                                             | `/mnt/data/results-llama-cpp`                                 |
 | `--models`      | Restrict to a subset of model ids (repeatable).                     | the 4 models from `cross_quantization_comparison.DEFAULT_MODELS` |
-| `--quants`      | Restrict to a subset of quant dirs (repeatable).                    | all valid quants (incl. the `UnifRand` baseline)               |
+| `--quants`      | Restrict to a subset of quant dirs (repeatable).                    | all valid quants; baseline routers always excluded from the average |
 | `--output-dir`  | Output directory.                                                   | `<results-dir>/paper_heatmaps/cross_quant_sweep`               |
 | `--width-in`    | Figure width in inches.                                             | `11.0`                                                        |
 | `--height-in`   | Figure height in inches.                                            | `3.5`                                                         |
 | `--dpi`         | Output DPI.                                                         | `300`                                                         |
 | `--k-min`       | Minimum K in the sweep.                                             | `1`                                                           |
-| `--k-max-frac`  | `K_max = ceil(n_expert * k_max_frac)`.                              | `0.50`                                                        |
+| `--k-max-frac`  | Hard bound `K_max = ceil(n_expert * k_max_frac)`. `K_model` always kept. | `0.50`                                                        |
 | `--num-ks`      | Number of K values in the linear sweep.                             | `21`                                                          |
-| `--self-check`  | Assert the bold line at `K_model` equals the heatmap's off-diagonal mean. Implies `--force`. | off                        |
+| `--self-check`  | Assert the bold line at `K_model` equals the heatmap's off-diagonal mean over the same real quants. Implies `--force`. | off                        |
 | `--force`       | Re-render even if the output PNG already exists.                    | off                                                           |
 
 The script imports its quant discovery and heatmap matrices
 directly from `cross_quantization_comparison.py` rather than
 duplicating the loader, so it always sweeps exactly the quant set
-the heatmap plots. `--self-check` re-derives the heatmap's Jaccard
-matrix through the heatmap's own loader and asserts the bold line's
-value at `K = K_model` equals that matrix's off-diagonal mean
-(tolerance `1e-12`); it exits non-zero if the two views would
-disagree, so the figure can never silently contradict the heatmap.
+the heatmap plots — minus the baseline router, which is dropped
+using that script's own `_QUANT_PUBLISH_OVERRIDES` table rather
+than a hardcoded directory name. `--self-check` re-derives the
+heatmap's Jaccard matrix through the heatmap's own loader,
+restricted to the same real quantizations, and asserts the bold
+line's value at `K = K_model` equals that sub-matrix's
+off-diagonal mean (tolerance `1e-12`); it exits non-zero if the two
+views would disagree, so the figure can never silently contradict
+the heatmap.
 
 ## Cross-model comparison figure (for the paper)
 

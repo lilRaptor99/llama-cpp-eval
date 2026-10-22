@@ -3,28 +3,45 @@
 
 """Publication-quality cross-quantization K-sweep figure for the MoE-routing paper.
 
-Cross-quant counterpart of `paper_jaccard_global_sweep.py` (which is
-its cross-dataset twin). For each model, this script renders the
-**mean pairwise Jaccard** as a function of K (top-K experts per
-quantization, K = K_model marker):
+For each model, this script renders the
+**mean pairwise Jaccard** across *real* quantizations as a function
+of K (top-K experts per quantization, K = K_model marker):
 
     A_q_K[l]  = top-K experts in quant q of model m, layer l
                 (descending count, ties -> ascending expert id)
     For each (K, layer l):
       J_K[l][i,j] = |A_i_K[l] ∩ A_j_K[l]| / |A_i_K[l] ∪ A_j_K[l]|
-                    averaged across the C(N_q, 2) off-diagonal quant pairs
+                    averaged across the C(N_real, 2) off-diagonal
+                    quant pairs
     Bold mean line:  mean over the L layers of J_K[l]
     Thin per-layer traces:  one trace per layer
+
+The `UnifRand` (random-router) baseline is deliberately **excluded**
+from the average: it is not a quantization, and folding it in lets a
+single structureless router contribute C(N_real, 2) near-chance
+pairs that dilute the quant-to-quant signal while mixing two
+different populations into one number. Instead it appears as its own
+dashed reference line — the exact expected Jaccard of two
+independent uniform K-subsets of an E-set — so "how much of this
+overlap is just chance?" is answerable without contaminating the
+statistic being plotted. See `_expected_random_jaccard`.
 
 Layout: 1 row x N_models columns (shared K axis). Each column shows
 one model. K_model is drawn as a vertical dotted line on every column
 AND labeled in-axes ("K = K_model = N") right above the curve at the
 top, plus a shared figure-level legend at the bottom explaining
-the per-layer trace, bold mean line, and K_model marker. The
+the per-layer trace, bold mean line, the uniform-random reference
+line, and the K_model marker. The
 generalized |∩|/|∪| (strict consensus) curve is intentionally NOT
 included: it collapses to 0 the moment one dataset (here, one quant)
 diverges, drowning the signal in noise — the mean pairwise Jaccard
 already conveys the same information without that floor.
+
+The K axis is capped at `ceil(E * k_max_frac)` (E/2 by default). Past
+E/2, top-K sets are so large that overlap is forced high by
+pigeonhole — a *random* router already reaches ~0.61 Jaccard at
+K = 0.75E for Mixtral — so the high-K end of a panel measures
+geometry, not routing stability, and flattens away any real trend.
 
 Output (under `<output-dir>/`, default
 `<results-dir>/paper_heatmaps/cross_quant_sweep/`):
@@ -37,18 +54,22 @@ by `cross_quantization_comparison.py` and tabulated by
 `cross_quant_matrix_table.py`.
 
 Mathematical contract (identical to `paper_heatmaps.py::` and the
-existing eval-moe-overview Jaccard helpers):
+existing eval-moe-overview Jaccard helpers, except that the
+baseline router is excluded — see below):
 
   Off-diagonal mean (i != j), per layer:
-    mean_offdiag_K[l] = mean over all C(N_q, 2) pairs
+    mean_offdiag_K[l] = mean over all C(N_real, 2) pairs
                         (i, j) with i != j of J_K[l][i, j]
   Per-layer traces:  L lines, one per layer l, of mean_offdiag_K[l].
   Mean line:        mean over l of mean_offdiag_K[l].
-  Off-diagonal convention matches the cross-quantization heatmap
-  (which also averages J across all C(N_q, 2) off-diagonal pairs at
-  K = K_model): at K = K_model the bold line's value equals the
-  off-diagonal mean of the heatmap's Jaccard matrix to floating-point
-  precision.
+  Random reference: exact E[Jaccard] over two independent uniform
+                    K-subsets of an E-set, drawn as a dashed line.
+  Off-diagonal convention matches the cross-quantization heatmap,
+  restricted to the same N_real quantizations (the heatmap still
+  plots UnifRand as one of its axes; `--self-check` compares against
+  the heatmap's real-quant sub-matrix): at K = K_model the bold
+  line's value equals the off-diagonal mean of that sub-matrix to
+  floating-point precision.
 
 Edge cases (mirrors `paper_heatmaps._jaccard`):
   both empty sets        -> 1.0
@@ -59,6 +80,7 @@ Edge cases (mirrors `paper_heatmaps._jaccard`):
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -84,10 +106,18 @@ from paper_heatmaps import (  # noqa: E402
 
 from cross_quantization_comparison import (  # noqa: E402
     DEFAULT_MODELS,
+    _QUANT_PUBLISH_OVERRIDES,
     _compute_model_cross_quant_matrices,
     _discover_quants,
     _load_one_quant_overview_safe,
 )
+
+
+# Quant directories that hold a *baseline router* rather than a real
+# quantisation. Derived from the heatmap script's own override table
+# (`{"RANDOM": "UnifRand"}`) instead of being hardcoded here, so the
+# two scripts can never drift apart on which directory is the baseline.
+_RANDOM_QUANT_DIRS: frozenset[str] = frozenset(_QUANT_PUBLISH_OVERRIDES)
 
 
 # ----------------------------------------------------------------- constants
@@ -99,8 +129,9 @@ FIGURE_WIDTH_IN: float = 11.0
 FIGURE_HEIGHT_IN: float = 3.5
 DPI: int = 300
 
-# Color scheme (same as paper_jaccard_global_sweep.py so the two
-# paper K-sweep figures read as siblings to reviewers).
+# Color scheme. Light-blue thin per-layer traces under a bold navy
+# mean line; same palette family as the 120 DPI overview plots so a
+# reviewer reading both figures recognises the same metric.
 LAYER_COLOR: str = "#4477aa"
 LAYER_ALPHA: float = 0.18
 LAYER_LINEWIDTH: float = 0.7
@@ -108,6 +139,13 @@ MEAN_COLOR: str = "#1f3a5f"
 MEAN_LINEWIDTH: float = 2.4
 K_MODEL_COLOR: str = "#888888"
 REFERENCE_COLOR: str = "#cccccc"
+
+# Uniform-random reference line. Vermillion sits opposite the
+# navy/blue family used for the data traces on the colour wheel, so it
+# stays separable for red-green colourblind readers and does not
+# collapse into the light-gray `y = 1` guide.
+RANDOM_COLOR: str = "#c1571f"
+RANDOM_LINEWIDTH: float = 1.4
 
 # y-axis range. Allows headroom for the K_model annotation sitting
 # just under y = 1.0.
@@ -129,7 +167,9 @@ TITLE_FONTSIZE: int = 9
 LEGEND_FONTSIZE: int = 9
 ROW_LABEL_FONTSIZE: int = 10
 
-# Default CLI K-sweep grid (matches paper_jaccard_global_sweep.py).
+# Default CLI K-sweep grid. Shares the `jaccard_sweep_from_cpp.py`
+# conventions (k_min=1, k_max=ceil(E/2), 21 samples) so this figure's
+# K axis lines up with the 120 DPI overview plots.
 DEFAULT_K_MIN: int = 1
 DEFAULT_K_MAX_FRAC: float = 0.50
 DEFAULT_NUM_KS: int = 21
@@ -194,6 +234,75 @@ def _offdiag_pairwise_mean_per_layer(jk: np.ndarray
     return (s - N_q) / n_off
 
 
+def _expected_random_jaccard(K: int, E: int) -> float:
+    """Exact E[Jaccard] between two independent uniform K-subsets of an E-set.
+
+    This is the "chance level" for the UnifRand reference line: the
+    overlap two routers with *no* shared structure would show.
+
+    For two independently drawn uniform K-subsets A, B of an E-element
+    universe, the overlap count j = |A ∩ B| is hypergeometric:
+
+        P(j) = C(K, j) * C(E - K, K - j) / C(E, K)
+
+    over the feasible support max(0, 2K - E) <= j <= K (the lower bound
+    is forced positive once K > E/2, since two K-subsets of an E-set
+    cannot miss each other by more than E - 2K). With |A ∪ B| = 2K - j,
+    the expectation is
+
+        E[J] = sum_j P(j) * j / (2K - j)
+
+    Note this is NOT approximately K/E: the common shortcut
+    E[|A ∩ B|] / E[|A ∪ B|] = K / (2E - K) overestimates badly
+    (at K = E/2 it predicts 0.50 where the true expectation is 0.34),
+    and even that ratio-of-expectations is not E[ratio]. The exact sum
+    above is cheap — E <= 128 and K <= E here, so at most 129 terms —
+    and is what the figure draws.
+
+    Validated against the measured `RANDOM` runs in the results tree:
+    the theoretical curve tracks the empirical UnifRand-vs-quant
+    Jaccard to within ~0.01 for OLMoE and Qwen3 across the whole
+    non-degenerate K range.
+    """
+    if E <= 0:
+        return float("nan")
+    if K <= 0:
+        # Matches `paper_heatmaps._jaccard`: two empty sets score 1.0.
+        return 1.0
+    if K > E:
+        return float("nan")
+    denom = float(math.comb(E, K))
+    if denom <= 0:
+        return float("nan")
+    total = 0.0
+    for j in range(max(0, 2 * K - E), K + 1):
+        p = math.comb(K, j) * math.comb(E - K, K - j) / denom
+        total += p * (j / (2 * K - j))
+    return total
+
+
+def _cap_k_grid(k_values: list[int], k_cap: int, k_model: int) -> list[int]:
+    """Clip a K grid to `k_cap`, but never drop the K_model operating point.
+
+    `_make_k_values` force-includes `min(3 * K_model, n_expert)` so
+    that related overview plots line up on the same K axis. For every
+    model in the default set that extra anchor happens to land at or
+    below E/2, but it can exceed it whenever 3 * K_model > E/2 —
+    Mixtral (E=8, K_model=2) reaches K=6, i.e. 0.75E. Past E/2 the
+    overlap is forced high by pigeonhole, so the cap is applied here,
+    in this script, rather than by editing the shared helper and
+    perturbing the other figures that rely on it.
+
+    If K_model itself exceeds `k_cap` (only possible for a model that
+    is barely sparse), the operating point is retained anyway: dropping
+    it would remove the K_model marker and make `--self-check`
+    unindexable. The caller warns in that case.
+    """
+    capped = {k for k in k_values if k <= k_cap}
+    capped.add(k_model)
+    return sorted(capped)
+
+
 def _compute_k_sweep(counts: list[np.ndarray], K_values: list[int], L: int
                       ) -> tuple[np.ndarray, np.ndarray]:
     """Run the full K-sweep.
@@ -236,9 +345,15 @@ def _cross_quant_jaccard_reference(*, model_dir_ref: Path, K_model: int,
     anything from this module, so agreement is real evidence that the
     two views describe the same quantity.
 
+    `only_quants` MUST be the *real* quantization directory names, not
+    the user's raw `--quants` filter. The heatmap still renders UnifRand
+    as one of its axes, but this script excludes it from the average,
+    so the comparison is against the heatmap's real-quant sub-matrix —
+    the same C(N_real, 2) pairs the bold line averages.
+
     Raises SystemExit when the heatmap's quant count differs from
     `n_quants` — that would mean this script is sweeping a different
-    quant set than the heatmap plots, which invalidates the check.
+    quant set than the reference, which invalidates the check.
     """
     data = _compute_model_cross_quant_matrices(model_dir_ref, only_quants)
     if data is None:
@@ -267,15 +382,16 @@ def render_paper_cross_quant_jaccard_sweep(
         force: bool = False,
         self_check: bool = False,
         model_dir_ref_for: dict[str, Path] | None = None,
-        only_quants: list[str] | None = None,
         ) -> dict[str, Any]:
     """Render the publication-quality cross-quant Jaccard K-sweep PNG.
 
     `per_model`: dict mapping short_name -> {
         "model_safe": str,
         "arch": {name, n_layer, n_expert, n_expert_used},
-        "counts_list": list[np.ndarray],  # one [L, E] per quant
-        "quant_labels": list[str],
+        "counts_list": list[np.ndarray],  # one [L, E] per REAL quant
+        "quant_labels": list[str],        # publish labels of those quants
+        "real_quant_dir_names": list[str],  # their directory names, for
+                                            # the --self-check reference
     }
     Returns a summary dict for stdout reporting.
     """
@@ -298,14 +414,30 @@ def render_paper_cross_quant_jaccard_sweep(
     # differs across models. We do NOT force a shared x range: each
     # panel is normalized to its own K sweep so the curve fills the
     # panel width regardless of expert count.
+    #
+    # The grid is then capped at ceil(E * k_max_frac) (E/2 by default).
+    # `_make_k_values` force-includes min(3 * K_model, E), which for
+    # Mixtral (E=8, K_model=2) reaches K=6 = 0.75E and would otherwise
+    # sail past the cap. At that density even a uniformly random router
+    # reaches ~0.61 Jaccard, so the high-K tail measures set geometry
+    # rather than routing stability.
     k_grids: dict[str, list[int]] = {}
     archs: dict[str, dict[str, Any]] = {}
+    warned_k_model: set[str] = set()
     for short_name, data in per_model.items():
         arch = data["arch"]
         archs[short_name] = arch
         K_model = arch["n_expert_used"]
         E = arch["n_expert"]
-        K_values = _make_k_values(E, K_model, k_min, k_max_frac, num_ks)
+        k_cap = max(int(np.ceil(E * k_max_frac)), k_min)
+        if K_model > int(np.ceil(E * k_max_frac)) and short_name not in warned_k_model:
+            warned_k_model.add(short_name)
+            print(f"[warn] {short_name}: K_model={K_model} exceeds the "
+                  f"--k-max-frac cap of {int(np.ceil(E * k_max_frac))}; "
+                  f"keeping K_model so the operating point stays visible")
+        K_values = _cap_k_grid(
+            _make_k_values(E, K_model, k_min, k_max_frac, num_ks),
+            k_cap, K_model)
         k_grids[short_name] = K_values
 
     fig, axes = plt.subplots(
@@ -349,11 +481,12 @@ def render_paper_cross_quant_jaccard_sweep(
                     f"call render_paper_cross_quant_jaccard_sweep() with "
                     f"model_dir_ref_for."
                 )
-            ref = _cross_quant_jaccard_reference(model_dir_ref=ref_dir,
-                                                 K_model=K_model,
-                                                 n_layers=L,
-                                                 n_quants=len(counts),
-                                                 only_quants=only_quants)
+            ref = _cross_quant_jaccard_reference(
+                model_dir_ref=ref_dir,
+                K_model=K_model,
+                n_layers=L,
+                n_quants=len(counts),
+                only_quants=data["real_quant_dir_names"])
             diff = abs(mean_curve[K_values.index(K_model)] - ref)
             status = "OK" if diff <= 1e-12 else "MISMATCH"
             print(f"[self-check] {short_name}: "
@@ -367,15 +500,26 @@ def render_paper_cross_quant_jaccard_sweep(
                     f"(> 1e-12); the figure would contradict the heatmap."
                 )
 
+        # ---- Uniform-random reference: the Jaccard two routers with
+        # no shared structure would show at this K. Drawn *under* the
+        # data lines (zorder) so a measured curve sitting above chance
+        # stays legible even where the two nearly touch. This replaces
+        # the UnifRand run that used to be folded into the average, so
+        # the baseline is still visible but no longer contaminates it.
+        random_curve = np.array([_expected_random_jaccard(k, E)
+                                 for k in K_values], dtype=np.float64)
+        ax.plot(K_arr, random_curve,
+                color=RANDOM_COLOR, linestyle="--",
+                linewidth=RANDOM_LINEWIDTH, zorder=2)
         # Thin per-layer traces.
         for layer in range(L):
             ax.plot(K_arr, per_layer[:, layer],
                     color=LAYER_COLOR, alpha=LAYER_ALPHA,
-                    linewidth=LAYER_LINEWIDTH)
+                    linewidth=LAYER_LINEWIDTH, zorder=1)
         # Bold mean-across-layers line.
         ax.plot(K_arr, mean_curve,
                 color=MEAN_COLOR, linewidth=MEAN_LINEWIDTH,
-                marker="o", markersize=4)
+                marker="o", markersize=4, zorder=3)
         # K_model vertical marker.
         ax.axvline(K_model, color=K_MODEL_COLOR, linestyle=":",
                    linewidth=0.8)
@@ -424,18 +568,21 @@ def render_paper_cross_quant_jaccard_sweep(
                           labelpad=8, va="center")
 
     # One figure-level legend explaining the trace / mean line /
-    # K_model marker. Bottom of the figure, centered. Use Line2D
-    # handles so the marker styles match the actual drawing.
+    # random reference / K_model marker. Bottom of the figure,
+    # centered. Use Line2D handles so the marker styles match the
+    # actual drawing.
     legend_handles = [
         Line2D([0], [0], color=LAYER_COLOR, alpha=LAYER_ALPHA,
                linewidth=LAYER_LINEWIDTH, label="Per-Layer Mean"),
         Line2D([0], [0], color=MEAN_COLOR, linewidth=MEAN_LINEWIDTH,
                marker="o", markersize=4, label="Layer-Averaged Mean"),
+        Line2D([0], [0], color=RANDOM_COLOR, linestyle="--",
+               linewidth=RANDOM_LINEWIDTH, label="UnifRand Expected"),
         Line2D([0], [0], color=K_MODEL_COLOR, linestyle=":",
                linewidth=0.8, label="K = K_model"),
     ]
     fig.legend(handles=legend_handles, loc="lower center",
-               ncol=3, frameon=False, fontsize=LEGEND_FONTSIZE,
+               ncol=4, frameon=False, fontsize=LEGEND_FONTSIZE,
                bbox_to_anchor=(0.5, 0.0))
 
     # `bbox_inches="tight"` at save time overrides figure margins, so
@@ -480,7 +627,9 @@ def main() -> int:
         "--quants", action="append", default=None,
         help="Restrict to a subset of quant subdirectories "
              "(repeatable). Default: all quants with valid "
-             "counts_total_overview.json.",
+             "counts_total_overview.json. Baseline routers (RANDOM) "
+             "are excluded from the average regardless of this flag "
+             "and appear only as the UnifRand reference line.",
     )
     parser.add_argument(
         "--output-dir", type=Path, default=None,
@@ -505,9 +654,13 @@ def main() -> int:
     )
     parser.add_argument(
         "--k-max-frac", type=float, default=DEFAULT_K_MAX_FRAC,
-        help="K_max = ceil(n_expert * k_max_frac) (default: 0.50). "
-             "Same default as paper_jaccard_global_sweep.py so the "
-             "two K-sweep figures share their K grid conventions.",
+        help="Hard upper bound on K: K_max = ceil(n_expert * "
+             "k_max_frac) (default: 0.50, i.e. E/2). Past E/2 overlap "
+             "is forced high by pigeonhole — a uniformly random "
+             "router already scores ~0.61 Jaccard at K = 0.75E — so "
+             "the high-K tail measures set geometry rather than "
+             "routing stability. K_model itself is always retained, "
+             "even if it exceeds the cap.",
     )
     parser.add_argument(
         "--num-ks", type=int, default=DEFAULT_NUM_KS,
@@ -522,8 +675,9 @@ def main() -> int:
         "--self-check", action="store_true",
         help="Verify that the bold line's value at K = K_model equals "
              "the off-diagonal mean of the cross-quantization "
-             "heatmap's Jaccard matrix (agreement to 1e-12), then "
-             "render normally. Exits non-zero on mismatch.",
+             "heatmap's Jaccard matrix over the same REAL "
+             "quantizations (agreement to 1e-12), then render "
+             "normally. Exits non-zero on mismatch.",
     )
     args = parser.parse_args()
 
@@ -560,32 +714,44 @@ def main() -> int:
                   f"skipping model {short_name}")
             continue
         records = _iter_quant_records(model_dir, args.quants)
+        # Split off the uniform-random baseline router. It is not a
+        # quantisation: averaging it in lets one structureless router
+        # contribute C(N_real, 2) near-chance pairs, diluting the
+        # quant-to-quant signal and mixing two populations into one
+        # number. It is drawn as a reference line instead.
+        real_records = [r for r in records
+                        if r["quant_dir_name"] not in _RANDOM_QUANT_DIRS]
+        baseline_records = [r for r in records
+                            if r["quant_dir_name"] in _RANDOM_QUANT_DIRS]
+        if len(real_records) < 2:
+            print(f"[warn] {model_dir}: <2 real quantisations after "
+                  f"excluding baseline routers "
+                  f"{[r['quant_dir_name'] for r in baseline_records]}; "
+                  f"skipping model {short_name}")
+            continue
         model_dir_ref_for[short_name] = model_dir
+        real_quant_dir_names = [r["quant_dir_name"] for r in real_records]
         per_model[short_name] = {
             "model_safe": model_safe,
             "arch": data["arch"],
-            # Keep ALL quants (including the `UnifRand` baseline) so the
-            # bold-line value at K = K_model matches the heatmap's
-            # off-diagonal mean exactly. The baseline exists in the
-            # cross-quant result tree and is part of the paper's
-            # cross-quantization view; excluding it here would diverge
-            # from `cross_quantization_comparison.py` and confuse
-            # readers comparing the two figures.
-            "quant_labels": [r["publish_label"] for r in records],
+            "quant_labels": [r["publish_label"] for r in real_records],
+            # Used by `--self-check` to restrict the heatmap reference
+            # matrix to the same real-quants the bold line averages.
+            "real_quant_dir_names": real_quant_dir_names,
             "counts_list": [
-                _load_one_counts_total(model_dir, r["quant_dir_name"])
-                for r in records
+                _load_one_counts_total(model_dir, name)
+                for name in real_quant_dir_names
             ],
         }
-        if len(per_model[short_name]["counts_list"]) < 2:
-            print(f"[warn] {model_dir}: <2 valid quantisations "
-                  f"found; skipping model {short_name}")
-            per_model.pop(short_name, None)
-            continue
+        baseline_note = (
+            f"; baseline-as-reference="
+            f"{[r['publish_label'] for r in baseline_records]}"
+            if baseline_records else "; no baseline router present")
         print(f"[load] {short_name}: {data['arch']['name']} "
               f"L={data['arch']['n_layer']} E={data['arch']['n_expert']} "
               f"K_model={data['arch']['n_expert_used']}; "
-              f"quants={per_model[short_name]['quant_labels']}")
+              f"quants={per_model[short_name]['quant_labels']}"
+              f"{baseline_note}")
 
     if not per_model:
         raise SystemExit("[error] no models loaded successfully")
@@ -595,7 +761,7 @@ def main() -> int:
         width_in=args.width_in, height_in=args.height_in, dpi=args.dpi,
         k_min=args.k_min, k_max_frac=args.k_max_frac, num_ks=args.num_ks,
         force=args.force, self_check=args.self_check,
-        model_dir_ref_for=model_dir_ref_for, only_quants=args.quants,
+        model_dir_ref_for=model_dir_ref_for,
     )
     return 0
 

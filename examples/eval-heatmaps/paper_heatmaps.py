@@ -392,12 +392,59 @@ def _make_k_values(n_expert: int, n_expert_used: int,
     return [k for k in base_ints if 1 <= k <= n_expert]
 
 
+def _active_layers(counts_list: list[np.ndarray], n_layers: int) -> list[int]:
+    """Return the layer indices that carry at least one expert selection.
+
+    A layer where EVERY unit has an all-zero count row carries no
+    measurement. Two of the metric conventions mis-score such a layer,
+    so averaging it in biases the result:
+
+      * `_jaccard(empty, empty)` is defined as **1.0** ("perfect
+        agreement"), so an unmeasured layer silently counts as total
+        agreement and inflates every Jaccard cell.
+      * `_jensen_shannon_divergence(empty, empty)` is **0.0**, so the
+        same layer dilutes every JSD cell toward zero.
+
+    DeepSeek-MoE-16B has exactly this: layer 0 is empty for all six
+    quantisations AND all six benchmarks (its first block is not
+    MoE-routed, so no expert is ever selected there). Including it
+    contributed 1/28 = 0.036 to that model's Jaccard — 31% of the
+    reported 0.117 UnifRand-vs-quant value.
+
+    The filter drops a layer only when it is empty for EVERY unit. A
+    layer that is non-empty for some units but empty for others is
+    real data ("this dataset has no routing at this depth") and is
+    kept, because the metric helpers already score it meaningfully
+    (`_jaccard(non-empty, empty) == 0.0`).
+
+    Shared by all four layer-averaged matrix helpers so the figures
+    and the tables average over an identical layer list and continue
+    to agree bit-for-bit. Falls back to every layer when all are
+    empty, so a wholly-empty cell yields zeros rather than NaN.
+    """
+    if not counts_list:
+        return list(range(n_layers))
+    # Per-layer totals summed across units: shape (n_layers,).
+    per_layer_total = np.zeros(n_layers, dtype=np.float64)
+    for c in counts_list:
+        arr = np.asarray(c)
+        k = min(arr.shape[0], n_layers)
+        if k:
+            per_layer_total[:k] += arr[:k].sum(axis=1)
+    active = [l for l in range(n_layers) if per_layer_total[l] > 0.0]
+    return active if active else list(range(n_layers))
+
+
 def _layer_averaged_pairwise_jaccard(
         counts_list: list[np.ndarray], K: int, L: int
         ) -> np.ndarray:
     """Return the pairwise Jaccard matrix averaged across L layers.
 
     Returns M[i, j] = mean over layers of `_jaccard(top-K_i(l), top-K_j(l))`.
+
+    Layers that are empty for every unit are excluded from the mean
+    (see `_active_layers`); otherwise `_jaccard(empty, empty) == 1.0`
+    would score the unmeasured layer as perfect agreement.
     """
     N = len(counts_list)
     if N == 0:
@@ -405,13 +452,15 @@ def _layer_averaged_pairwise_jaccard(
     out = np.zeros((N, N), dtype=np.float64)
     for i in range(N):
         out[i, i] = 1.0
+    layers = _active_layers(counts_list, L)
     # Pre-compute per-(unit, layer) top-K sets.
     sets: list[list[set[int]]] = [
         [_top_k_set_for_layer(c, l, K) for l in range(L)] for c in counts_list
     ]
     for i in range(N):
         for j in range(i + 1, N):
-            v = float(np.mean([_jaccard(sets[i][l], sets[j][l]) for l in range(L)]))
+            v = float(np.mean([_jaccard(sets[i][l], sets[j][l])
+                               for l in layers]))
             out[i, j] = v
             out[j, i] = v
     return out
@@ -449,18 +498,23 @@ def _layer_averaged_js_divergence_matrix(
 
     Identical to `jaccard_sweep_from_cpp.py::_layer_averaged_js_divergence_matrix`.
     Returns M[i, j] = mean over layers of `_jensen_shannon_divergence(...)`.
+
+    Layers that are empty for every unit are excluded from the mean
+    (see `_active_layers`); otherwise `_jensen_shannon_divergence(empty,
+    empty) == 0.0` would dilute every cell toward zero.
     """
     n_items = len(counts_list)
     if n_items == 0:
         return np.zeros((0, 0), dtype=np.float64)
     n_layers = int(counts_list[0].shape[0])
+    layers = _active_layers(counts_list, n_layers)
     out = np.zeros((n_items, n_items), dtype=np.float64)
     for i in range(n_items):
         for j in range(i, n_items):
             vals = [
                 _jensen_shannon_divergence(counts_list[i][layer],
                                            counts_list[j][layer])
-                for layer in range(n_layers)
+                for layer in layers
             ]
             out[i, j] = out[j, i] = float(np.mean(vals)) if vals else 0.0
     return out
@@ -483,6 +537,11 @@ def _layer_averaged_pairwise_jaccard_with_std(
     Used by `cross_dataset_table.py` / `cross_quant_matrix_table.py`
     for the `layer_std` column of the paper tables. The figure scripts
     still call the std-free variant, so their output is unchanged.
+
+    Layers that are empty for every unit are excluded from BOTH the
+    mean and the std (see `_active_layers`) — the std is reported as
+    "how stable is this with depth", and an unmeasured layer is not a
+    low-variance observation, it is an absent one.
     """
     N = len(counts_list)
     if N == 0:
@@ -493,6 +552,7 @@ def _layer_averaged_pairwise_jaccard_with_std(
     for i in range(N):
         mean[i, i] = 1.0
         std[i, i] = 0.0
+    layers = _active_layers(counts_list, L)
     # Pre-compute per-(unit, layer) top-K sets — identical to the
     # std-free variant so the two agree exactly.
     sets: list[list[set[int]]] = [
@@ -500,7 +560,7 @@ def _layer_averaged_pairwise_jaccard_with_std(
     ]
     for i in range(N):
         for j in range(i + 1, N):
-            vals = [_jaccard(sets[i][l], sets[j][l]) for l in range(L)]
+            vals = [_jaccard(sets[i][l], sets[j][l]) for l in layers]
             v = float(np.mean(vals))
             mean[i, j] = mean[j, i] = v
             std[i, j] = std[j, i] = float(np.std(vals))
@@ -520,12 +580,16 @@ def _layer_averaged_js_divergence_matrix_with_std(
 
     The diagonal is exactly 0.0 with std 0.0 — the two distributions
     compared are the same object, so `log2(p/m) == 0` at every layer.
+
+    Layers that are empty for every unit are excluded from both the
+    mean and the std (see `_active_layers`).
     """
     n_items = len(counts_list)
     if n_items == 0:
         z = np.zeros((0, 0), dtype=np.float64)
         return z, z.copy()
     n_layers = int(counts_list[0].shape[0])
+    layers = _active_layers(counts_list, n_layers)
     mean = np.zeros((n_items, n_items), dtype=np.float64)
     std = np.zeros((n_items, n_items), dtype=np.float64)
     for i in range(n_items):
@@ -533,7 +597,7 @@ def _layer_averaged_js_divergence_matrix_with_std(
             vals = [
                 _jensen_shannon_divergence(counts_list[i][layer],
                                            counts_list[j][layer])
-                for layer in range(n_layers)
+                for layer in layers
             ]
             m = float(np.mean(vals)) if vals else 0.0
             s = float(np.std(vals)) if vals else 0.0

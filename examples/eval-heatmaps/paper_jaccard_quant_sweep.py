@@ -28,10 +28,13 @@ statistic being plotted. See `_expected_random_jaccard`.
 
 Layout: 1 row x N_models columns (shared K axis). Each column shows
 one model. K_model is drawn as a vertical dotted line on every column
-AND labeled in-axes ("K = K_model = N") right above the curve at the
-top, plus a shared figure-level legend at the bottom explaining
+AND labeled just ABOVE the plot area ("K = N") at that line's x
+position, so the label can never overlap a curve or the `y = 1`
+reference, plus a shared figure-level legend at the bottom explaining
 the per-layer trace, bold mean line, the uniform-random reference
-line, and the K_model marker. The
+line, and the K_model marker. Column titles carry the model name
+only — the architecture numbers are omitted, since K_model is already
+the dotted line's own label and L / E would only crowd it. The
 generalized |∩|/|∪| (strict consensus) curve is intentionally NOT
 included: it collapses to 0 the moment one dataset (here, one quant)
 diverges, drowning the signal in noise — the mean pairwise Jaccard
@@ -99,6 +102,7 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 from paper_heatmaps import (  # noqa: E402
+    _active_layers,
     _jaccard,
     _make_k_values,
     _top_k_set_for_layer,
@@ -166,6 +170,12 @@ TICK_FONTSIZE: int = 8
 TITLE_FONTSIZE: int = 9
 LEGEND_FONTSIZE: int = 9
 ROW_LABEL_FONTSIZE: int = 10
+
+# Title pad. Large enough to clear the `K = K_model` label, which is
+# drawn 2pt above the axes top: the label occupies roughly the
+# 2-10pt band, so the title starts at 14pt and the two never overlap
+# regardless of how wide the model name is.
+TITLE_PAD: float = 14
 
 # Default CLI K-sweep grid. Shares the `jaccard_sweep_from_cpp.py`
 # conventions (k_min=1, k_max=ceil(E/2), 21 samples) so this figure's
@@ -314,18 +324,28 @@ def _compute_k_sweep(counts: list[np.ndarray], K_values: list[int], L: int
       mean_curve: (n_K,) array. `mean_curve[k_idx]` is the layer-
                   averaged value (mean over l of per_layer[k_idx, l]).
 
+    `per_layer` keeps all L columns (unmeasured layers included) so
+    its shape stays `(n_K, L)` and callers can index by layer. The
+    MEAN, however, runs only over the active layers — see
+    `paper_heatmaps._active_layers`. Without that, DeepSeek-MoE-16B's
+    unmeasured layer 0 would score 1.0 (`_jaccard(empty, empty)`) and
+    inflate every point of the bold line by `1/L`, and the figure
+    would contradict the heatmap, which drops the same layer.
+
     The K-sweep is O(num_ks * L * N_q^2) on top-K extraction +
     set ops, dominated by the top-K itself. Same `np.mean`
-    convention as `_layer_averaged_pairwise_jaccard`, so the
-    bold line at K = K_model equals the heatmap's off-diagonal
-    mean to floating-point precision.
+    convention and same active-layer list as
+    `_layer_averaged_pairwise_jaccard`, so the bold line at
+    K = K_model equals the heatmap's off-diagonal mean to
+    floating-point precision (asserted by `--self-check`).
     """
     n_K = len(K_values)
     per_layer = np.zeros((n_K, L), dtype=np.float64)
+    active = _active_layers(counts, L)
     for k_idx, K in enumerate(K_values):
         jk = _pairwise_jaccard_per_layer(counts, K, L)
         per_layer[k_idx] = _offdiag_pairwise_mean_per_layer(jk)
-    mean_curve = per_layer.mean(axis=1)
+    mean_curve = per_layer[:, active].mean(axis=1)
     return per_layer, mean_curve
 
 
@@ -511,8 +531,13 @@ def render_paper_cross_quant_jaccard_sweep(
         ax.plot(K_arr, random_curve,
                 color=RANDOM_COLOR, linestyle="--",
                 linewidth=RANDOM_LINEWIDTH, zorder=2)
-        # Thin per-layer traces.
-        for layer in range(L):
+        # Thin per-layer traces. Only layers that actually carry a
+        # measurement are drawn: DeepSeek-MoE-16B's layer 0 is empty
+        # for every quantisation, and `_jaccard(empty, empty) == 1.0`
+        # would render it as a phantom trace pinned at perfect
+        # agreement across the whole K range — a line that looks like
+        # a real observation but is an absent one.
+        for layer in _active_layers(counts, L):
             ax.plot(K_arr, per_layer[:, layer],
                     color=LAYER_COLOR, alpha=LAYER_ALPHA,
                     linewidth=LAYER_LINEWIDTH, zorder=1)
@@ -526,13 +551,20 @@ def render_paper_cross_quant_jaccard_sweep(
         # Perfect-agreement horizontal reference.
         ax.axhline(1.0, color=REFERENCE_COLOR, linestyle="--",
                    linewidth=0.6)
-        # In-axes K_model annotation. Places the text just under
-        # y = 1 at the K_model x position so it sits ABOVE the curve
-        # (curves are mostly < 1.0 at K_model). Use a small offset so
-        # it doesn't kiss the reference line.
-        ax.text(K_model, Y_MAX - 0.04, f"K={K_model}",
-                ha="center", va="top", fontsize=TICK_FONTSIZE,
-                color=K_MODEL_COLOR)
+        # K_model label. Anchored to the TOP EDGE of the axes and
+        # lifted clear of the plotting area, so it can never overlap
+        # a curve, the `y = 1` reference, or the UnifRand line no
+        # matter how high a panel's data climbs. `xycoords` mixes a
+        # data x with an axes-fraction y: x follows K_model so the
+        # label stays registered to its dotted line, while y is pinned
+        # to the axes top regardless of the data range.
+        ax.annotate(
+            f"K={K_model}",
+            xy=(K_model, 1.0), xycoords=("data", "axes fraction"),
+            xytext=(0, 2), textcoords="offset points",
+            ha="center", va="bottom",
+            fontsize=TICK_FONTSIZE, color=K_MODEL_COLOR,
+        )
         # Clean axes.
         ax.set_ylim(Y_MIN, Y_MAX)
         # Keep each subplot's x extent local so the K_model line stays
@@ -549,10 +581,12 @@ def render_paper_cross_quant_jaccard_sweep(
             MaxNLocator(nbins=6, integer=True, prune="both"))
         for spine in ax.spines.values():
             spine.set_visible(False)
-        # Column title = short model name + arch line (kept tight so
-        # readers get the model + K_model in one glance).
-        ax.set_title(f"{short_name}\nL={L} E={E} K={K_model}",
-                     fontsize=TITLE_FONTSIZE, pad=4)
+        # Column title = short model name only. The architecture
+        # numbers (L / E / K_model) used to sit on a second line;
+        # they are all either derivable from the panel or already
+        # labelled elsewhere (K_model is the dotted line's own
+        # label), and the second line only crowded the K label above.
+        ax.set_title(short_name, fontsize=TITLE_FONTSIZE, pad=TITLE_PAD)
         # Per-column x label. Each panel sweeps its own K grid (E
         # differs by 16x across models), so the axis name belongs to
         # each panel rather than to the figure — this also keeps it

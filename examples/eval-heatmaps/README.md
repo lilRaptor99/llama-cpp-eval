@@ -147,6 +147,50 @@ scientific colormaps.
 > colour gradient per-cell (e.g., per-figure `--jsd-cmap`) or open
 > an issue for an "auto-scale" mode (the earlier prototype used it).
 
+### Layers with no measurement are excluded from every average
+
+All four layer-averaged matrix helpers in `paper_heatmaps.py`
+(`_layer_averaged_pairwise_jaccard`,
+`_layer_averaged_pairwise_jaccard_with_std`,
+`_layer_averaged_js_divergence_matrix`,
+`_layer_averaged_js_divergence_matrix_with_std`) share one helper,
+`_active_layers`, which drops any layer whose count row is zero for
+**every** unit being compared.
+
+The reason is that both metrics score a layer with no data as if it
+were a real observation, in opposite directions:
+
+| Helper | Empty layer value | Effect of averaging it in |
+| --- | --- | --- |
+| `_jaccard(empty, empty)` | **1.0** ("perfect agreement") | inflates every Jaccard cell |
+| `_jensen_shannon_divergence(empty, empty)` | **0.0** ("zero divergence") | dilutes every JSD cell toward zero |
+
+DeepSeek-MoE-16B has exactly this: **layer 0 is empty for all six
+quantisations *and* all six benchmarks** — its first block is not
+MoE-routed, so no expert is ever selected there. Including it added
+`1/28 = 0.036` to that model's Jaccard, which was **31 % of the
+reported 0.117 UnifRand-vs-quant value**. After the fix DeepSeek's
+real-quant mean moves `0.8611 → 0.8560` and its JSD mean rises
+`+3.7 %` (the empty layer had been dragging JSD down). The other
+three models have no such layer and their numbers are bit-for-bit
+unchanged.
+
+A layer that is non-empty for *some* units but empty for others is
+real data — "this dataset has no routing at this depth" — and is
+**kept**, because the helpers already score it meaningfully
+(`_jaccard(non-empty, empty) == 0.0`). Only layers empty across
+every unit are dropped.
+
+Because the figures and the tables call these same helpers over the
+same layer list, they continue to agree bit-for-bit; the
+`--self-check` flags on `cross_quant_matrix_table.py` and
+`cross_dataset_table.py` assert this to `1e-12`.
+`paper_jaccard_quant_sweep.py` imports `_active_layers` too: its
+bold line averages over active layers only (so it matches the
+heatmap), its per-layer traces skip unmeasured layers (so DeepSeek
+no longer gets a phantom trace pinned at `y = 1.0`), and its panel
+title reports the averaged depth — DeepSeek reads `L=27`, not `L=28`.
+
 ## How it differs from the existing overview heatmaps
 
 | Concern                       | `eval-moe-overview/aggregate_overview.py` / `jaccard_sweep_from_cpp.py` / `cross_quant_jaccard_sweep_from_cpp.py` | `eval-heatmaps/paper_heatmaps.py`                          |
@@ -244,11 +288,11 @@ Layout is **1 row × N columns, one column per model**:
 
 ```
         [ OLMoE-1B-7B  ][ Mixtral-8x22B ][ DeepSeek-MoE-16B ][ Qwen3-30B-A3B ]
-         L=16 E=64 K=8 | L=56 E=8  K=2  | L=28 E=64  K=6   | L=48 E=128 K=8
+                       K=8           K=2          K=6           K=8      <- above each panel
 J                   |                |                |                |
 a                   |  thin per-layer traces + bold mean line        |
 c                   |  dashed UnifRand-expected chance line            |
-c                   |  dotted K = K_model marker, labeled K=8, K=2, … |
+c                   |  dotted K = K_model marker                       |
 c                   |                                                |
 i                   +------------------------------------------------+
 d                K              K               K               K
@@ -258,8 +302,11 @@ d                K              K               K               K
 Each panel draws thin per-layer traces (α=0.18), a bold
 layer-averaged mean line, the `y = 1.0` perfect-agreement reference,
 a dashed **UnifRand-expected** chance-level line, and a dotted
-vertical marker at `K = K_model` **labeled in-axes**
-with that model's value (`K=8`, `K=2`, …). The left gutter carries
+vertical marker at `K = K_model`. The `K = N` label sits **above the
+plot area**, registered to that dotted line's x position — anchored to
+the axes top edge rather than to a y value, so it can never overlap a
+curve, the `y = 1` reference, or the chance line however high a
+panel's data climbs. The left gutter carries
 the rotated row label `Jaccard Similarity`, matching the
 cross-quantization heatmap's `_draw_one_heatmap(row_label=...)`
 styling so the two figures share a visual vocabulary. Each column
@@ -268,6 +315,13 @@ models (Mixtral stops at `K=4`, Qwen3 at `K=64`), so the axis
 belongs to the panel rather than to the figure — and a shared
 4-column legend (`Per-Layer Mean` / `Layer-Averaged Mean` /
 `UnifRand Expected` / `K = K_model`) sits beneath them.
+
+Column titles carry the **model name only**. The architecture figures
+(`L =`, `E =`, `K_model =`) were removed from a second title line:
+`K_model` is already the dotted line's own label, and `L` / `E` only
+crowded it. The title's vertical padding (`TITLE_PAD`) is sized to
+clear the `K = N` label above the axes, so the two never collide at
+any model-name width.
 
 ### The `UnifRand` baseline is a reference line, not a member of the average
 
